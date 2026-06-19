@@ -1,0 +1,150 @@
+# =========================
+
+# Secrets / environment
+
+# =========================
+
+.env
+.env.*
+!.env.example
+
+# API keys or local credentials
+
+*.key
+*.pem
+*.secret
+secrets/
+credentials/
+
+# =========================
+
+# Python cache / build
+
+# =========================
+
+**pycache**/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# =========================
+
+# Virtual environments
+
+# =========================
+
+.venv/
+venv/
+env/
+ENV/
+.conda/
+*.conda
+
+# =========================
+
+# Project data
+
+# =========================
+
+# PutnamBench is external and should not be committed.
+
+data/
+!data/.gitkeep
+
+# =========================
+
+# Generated outputs
+
+# =========================
+
+outputs/
+!outputs/.gitkeep
+
+runs/
+!runs/.gitkeep
+
+# Generated experiment artifacts
+
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.jsonl.tmp
+
+# Codex / worker generated files
+
+prompt.txt
+stdout.txt
+stderr.txt
+combined_output.txt
+last_message.txt
+action.json
+
+# Lean generated attempts / temporary files
+
+attempt.lean
+attempt_*.lean
+*.olean
+*.ilean
+.lake/
+lake-packages/
+lakefile.olean
+lakefile.ilean
+
+# =========================
+
+# Logs
+
+# =========================
+
+*.log
+logs/
+debug/
+tmp/
+temp/
+
+# =========================
+
+# Notebook / analysis cache
+
+# =========================
+
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# =========================
+
+# OS / editor files
+
+# =========================
+
+.DS_Store
+Thumbs.db
+desktop.ini
+
+.vscode/
+!.vscode/settings.json
+!.vscode/extensions.json
+
+.idea/
+*.swp
+*.swo
+*~
+
+# =========================
+
+# Misc
+
+# =========================
+
+*.bak
+*.tmp
+*.cache
