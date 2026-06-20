@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import shlex
+import signal
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +20,10 @@ class CodexRunResult:
     command: list[str] | None = None
     last_message: str | None = None
     combined_output: str | None = None
+
+
+_ACTIVE_PROCESSES: set[subprocess.Popen[str]] = set()
+_ACTIVE_PROCESSES_LOCK = threading.Lock()
 
 
 def run_codex_exec(
@@ -65,31 +71,43 @@ def run_codex_exec(
     stderr = ""
     returncode = -1
     timed_out = False
+    proc: subprocess.Popen[str] | None = None
 
     try:
-        completed = subprocess.run(
+        proc = subprocess.Popen(
             command,
-            input=prompt,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             cwd=work_dir,
-            capture_output=True,
             text=True,
-            timeout=timeout_sec,
-            check=False,
             env=env,
+            start_new_session=_supports_process_groups(),
         )
-        stdout = completed.stdout
-        stderr = completed.stderr
-        returncode = completed.returncode
+        _register_process(proc)
+        stdout, stderr = proc.communicate(input=prompt, timeout=timeout_sec)
+        returncode = proc.returncode if proc.returncode is not None else -1
     except subprocess.TimeoutExpired as exc:
         stdout = _to_text(exc.stdout)
         stderr = _to_text(exc.stderr)
         stderr = f"{stderr}\nTimed out after {timeout_sec} seconds.".strip()
         timed_out = True
+        if proc is not None:
+            cleanup_messages = _terminate_process_tree(proc)
+            cleanup_stdout, cleanup_stderr = _safe_communicate_after_cleanup(proc)
+            stdout = _join_text(stdout, cleanup_stdout)
+            stderr = _join_text(stderr, cleanup_stderr, *cleanup_messages)
+            returncode = proc.returncode if proc.returncode is not None else -1
     except FileNotFoundError as exc:
         stderr = str(exc)
+    finally:
+        if proc is not None:
+            _unregister_process(proc)
 
     elapsed_sec = time.perf_counter() - start
     last_message = _read_optional_text(last_message_path)
+    if not last_message_path.exists():
+        last_message_path.write_text("", encoding="utf-8")
     combined_output = "\n".join(
         part for part in [stdout, stderr, last_message or ""] if part
     )
@@ -107,6 +125,94 @@ def run_codex_exec(
         last_message=last_message,
         combined_output=combined_output,
     )
+
+
+def terminate_active_codex_processes(*, grace_sec: float = 3.0) -> int:
+    with _ACTIVE_PROCESSES_LOCK:
+        processes = list(_ACTIVE_PROCESSES)
+    for proc in processes:
+        _terminate_process_tree(proc, grace_sec=grace_sec)
+        with _ACTIVE_PROCESSES_LOCK:
+            _ACTIVE_PROCESSES.discard(proc)
+    return len(processes)
+
+
+def _register_process(proc: subprocess.Popen[str]) -> None:
+    with _ACTIVE_PROCESSES_LOCK:
+        _ACTIVE_PROCESSES.add(proc)
+
+
+def _unregister_process(proc: subprocess.Popen[str]) -> None:
+    with _ACTIVE_PROCESSES_LOCK:
+        _ACTIVE_PROCESSES.discard(proc)
+
+
+def _terminate_process_tree(
+    proc: subprocess.Popen[str],
+    *,
+    grace_sec: float = 3.0,
+) -> list[str]:
+    messages: list[str] = []
+    if proc.poll() is not None:
+        return messages
+    messages.append("Codex cleanup start.")
+    _send_termination_signal(proc, signal.SIGTERM, messages)
+    try:
+        proc.wait(timeout=grace_sec)
+    except subprocess.TimeoutExpired:
+        messages.append(f"Process did not exit after {grace_sec:g}s grace period; sending kill.")
+        kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+        _send_termination_signal(proc, kill_signal, messages)
+        try:
+            proc.wait(timeout=grace_sec)
+        except subprocess.TimeoutExpired:
+            messages.append("Process did not exit after kill signal.")
+        except Exception as exc:
+            messages.append(f"Error waiting after kill: {exc}")
+    except Exception as exc:
+        messages.append(f"Error waiting after terminate: {exc}")
+    messages.append("Codex cleanup end.")
+    return messages
+
+
+def _send_termination_signal(
+    proc: subprocess.Popen[str],
+    sig: signal.Signals | int,
+    messages: list[str],
+) -> None:
+    try:
+        if _supports_process_groups():
+            os.killpg(os.getpgid(proc.pid), sig)
+        elif sig == signal.SIGTERM:
+            proc.terminate()
+        else:
+            proc.kill()
+    except ProcessLookupError:
+        return
+    except Exception as exc:
+        sig_name = getattr(sig, "name", str(sig))
+        messages.append(f"Process group cleanup with {sig_name} failed: {exc}")
+        try:
+            if sig == signal.SIGTERM:
+                proc.terminate()
+            else:
+                proc.kill()
+        except Exception as fallback_exc:
+            messages.append(f"Fallback cleanup with {sig_name} failed: {fallback_exc}")
+
+
+def _safe_communicate_after_cleanup(proc: subprocess.Popen[str]) -> tuple[str, str]:
+    try:
+        stdout, stderr = proc.communicate(timeout=1)
+    except subprocess.TimeoutExpired:
+        return "", "Could not collect remaining output after cleanup timeout."
+    except Exception as exc:
+        return "", f"Could not collect remaining output after cleanup: {exc}"
+    return _to_text(stdout), _to_text(stderr)
+
+
+def _supports_process_groups() -> bool:
+    return os.name == "posix"
 
 
 def _build_codex_command(
@@ -152,6 +258,10 @@ def _to_text(value: str | bytes | None) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return value
+
+
+def _join_text(*parts: str) -> str:
+    return "\n".join(part for part in parts if part).strip()
 
 
 def _read_optional_text(path: Path) -> str | None:

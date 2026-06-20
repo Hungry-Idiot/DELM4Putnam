@@ -32,6 +32,17 @@ def test_exhausted_budget_prevents_new_codex_call() -> None:
     assert budget.timeout_for(600) == 0
 
 
+def test_interactive_min_remaining_threshold() -> None:
+    disabled = interactive.TimeBudget(0)
+    low = interactive.TimeBudget(1)
+    low.start -= 0.9
+
+    assert interactive.has_enough_time_to_start_call(disabled, 30) is True
+    assert interactive.has_enough_time_to_start_call(low, 30) is False
+    assert interactive.has_enough_time_to_start_call(low, 0) is True
+    assert interactive.has_enough_time_to_start_call(low, -5) is True
+
+
 def test_interactive_max_steps_stopped_reason() -> None:
     reason = interactive.interactive_stopped_reason(
         success=False,

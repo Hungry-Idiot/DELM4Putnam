@@ -239,24 +239,56 @@ def build_interactive_worker_step_prompt(
     step_index: int,
     current_context_text: str,
     worker_history_text: str = "",
+    max_context_requests_per_worker: int = 1,
+    context_request_count: int = 0,
+    patch_attempt_count: int = 0,
+    previous_actions: list[str] | None = None,
+    last_check_status: str | None = None,
+    last_error: str | None = None,
+    shared_context_policy: str = "legacy",
 ) -> str:
+    context_policy = _interactive_context_policy(
+        max_context_requests_per_worker=max_context_requests_per_worker,
+        context_request_count=context_request_count,
+        patch_attempt_count=patch_attempt_count,
+        previous_actions=previous_actions or [],
+        last_check_status=last_check_status,
+        last_error=last_error,
+        shared_context_policy=shared_context_policy,
+    )
+    context_policy_section = ""
+    if context_policy:
+        context_policy_section = f"\nShared-context policy:\n{context_policy}\n"
+    request_context_format = ""
+    if shared_context_policy != "legacy" and max_context_requests_per_worker != 0:
+        request_context_format = """WORKER_ACTION
+action: REQUEST_CONTEXT
+summary: <why you need latest context>
+END_WORKER_ACTION
+
+or
+
+"""
     return f"""You are decentralized peer worker {worker_id} in a pull-based Shared Context multi-agent experiment.
 
 You are not a Main Agent. There is no Main Agent in this experiment.
 You only learn about other Agents indirectly through compact Shared Context shown in this prompt.
 The context below is the controller's most recent context snapshot for you.
-If you want the latest committed Shared Context, output REQUEST_CONTEXT.
-If you do not request context, the controller will not push newer changes to you.
 If you want to submit a candidate proof patch, output SUBMIT_PATCH.
 If you want to record a short useful note, output SUBMIT_NOTE.
 If you do not need to continue, output STOP.
 
 Rules:
+- Your primary goal is to submit a Lean proof patch that can be checked.
+- Prefer SUBMIT_PATCH when you have a concrete proof idea.
+- SUBMIT_PATCH content must be only the replacement proof body for the target theorem's `sorry`, usually starting with `by`.
+- Use SUBMIT_NOTE only for concise, non-empty, actionable information.
 - Do not run commands.
 - Do not modify files.
 - Do not communicate directly with other Workers.
 - Do not use full audit log content.
 - Proof patches must not contain `sorry`, `admit`, or `axiom`.
+{context_policy_section}
 
 Problem:
 problem_id: {problem_id}
@@ -279,14 +311,7 @@ Your previous local history:
 
 Choose exactly one output format.
 
-WORKER_ACTION
-action: REQUEST_CONTEXT
-summary: <why you need latest context>
-END_WORKER_ACTION
-
-or
-
-WORKER_ACTION
+{request_context_format}WORKER_ACTION
 action: SUBMIT_PATCH
 summary: <short summary>
 
@@ -317,3 +342,81 @@ action: STOP
 summary: <why stopping>
 END_WORKER_ACTION
 """
+
+
+def _interactive_context_policy(
+    *,
+    max_context_requests_per_worker: int,
+    context_request_count: int,
+    patch_attempt_count: int,
+    previous_actions: list[str],
+    last_check_status: str | None,
+    last_error: str | None,
+    shared_context_policy: str = "legacy",
+) -> str:
+    if shared_context_policy == "legacy":
+        return ""
+
+    previous_actions_text = ", ".join(previous_actions[-8:]) or "(none)"
+    last_check_text = last_check_status or "(none)"
+    last_error_text = last_error or "(none)"
+    if max_context_requests_per_worker == 0:
+        return "\n".join(
+            [
+                "- Shared-context requests are disabled for this run; do not choose REQUEST_CONTEXT.",
+                "- Work from the context already shown here and choose SUBMIT_PATCH, SUBMIT_NOTE, or STOP.",
+                f"- Current worker state: patch_attempt_count={patch_attempt_count}; "
+                f"context_request_count={context_request_count}; previous_actions={previous_actions_text}; "
+                f"last_check_status={last_check_text}; last_error={last_error_text}.",
+            ]
+        )
+
+    remaining_context_requests = (
+        "unlimited"
+        if max_context_requests_per_worker < 0
+        else str(max(0, max_context_requests_per_worker - context_request_count))
+    )
+    max_context_text = (
+        "unlimited"
+        if max_context_requests_per_worker < 0
+        else str(max_context_requests_per_worker)
+    )
+    state_lines = [
+        f"- Context request budget for you: used {context_request_count} of {max_context_text}; remaining {remaining_context_requests}.",
+        f"- Current worker state: worker_id is implicit in this prompt; step-local patch_attempt_count={patch_attempt_count}; "
+        f"has_requested_context={context_request_count > 0}; previous_actions={previous_actions_text}; "
+        f"last_check_status={last_check_text}; last_error={last_error_text}.",
+    ]
+    if shared_context_policy == "aggressive":
+        return "\n".join(
+            [
+                "- You are part of a multi-worker Lean proof search; do not work as if fully isolated on medium/hard Lean problems.",
+                "- Available shared-context action: REQUEST_CONTEXT.",
+                "- REQUEST_CONTEXT reads other workers' attempts, failed strategies, Lean errors, candidate proof ideas, and any verified patch information.",
+                *state_lines,
+                "- If you are not confident the next patch will pass Lean, request shared context before another risky patch attempt.",
+                "- If you have already submitted a patch and it failed, and you have not requested context yet, your next action should usually be REQUEST_CONTEXT unless you are highly confident you know the exact fix.",
+                "- Before a second or later risky patch attempt, prefer REQUEST_CONTEXT to inspect other workers' attempts, Lean errors, candidate lemmas, and partial proof ideas.",
+                "- Do not request context repeatedly if the budget is used up or if you have a concrete patch that is likely to pass Lean.",
+                "- Submit SUBMIT_PATCH only when you can provide a concrete Lean replacement proof body.",
+            ]
+        )
+
+    return "\n".join(
+        [
+            "- Balanced policy: REQUEST_CONTEXT is a repair aid, not a mandatory action.",
+            "- Available shared-context action: REQUEST_CONTEXT.",
+            "- REQUEST_CONTEXT reads other workers' attempts, failed strategies, Lean errors, candidate proof ideas, and any verified patch information.",
+            *state_lines,
+            "- Primary objective: submit a concrete Lean replacement proof body; SUBMIT_PATCH is preferred whenever you have a concrete proof idea.",
+            "- Good reasons to REQUEST_CONTEXT: a previous patch failed and you do not understand the Lean error; another worker may have useful failed attempts, candidate lemmas, or partial proof ideas; or you are about to make a second or later risky patch attempt and lack a concrete fix.",
+            "- Bad reasons to REQUEST_CONTEXT: only because context is available; before any real proof attempt on an easy-looking problem; repeatedly after already receiving context; or when you already have a concrete patch likely to pass Lean.",
+            "- After you REQUEST_CONTEXT once, your next action should usually be SUBMIT_PATCH using what you learned.",
+            "- Do not alternate REQUEST_CONTEXT and SUBMIT_PATCH mechanically.",
+            "- Do not request context twice unless the first context was insufficient and there is genuinely new information to obtain.",
+            "- If another worker already requested context recently and you have a concrete patch idea, prefer SUBMIT_PATCH.",
+            "- Avoid having all workers request context in the same round unless no worker has a viable patch idea.",
+            "- If a patch failed, consider REQUEST_CONTEXT only if it is likely to help; if you already know the concrete fix, submit the revised patch directly.",
+            "- Context should improve proof search, not replace proof search.",
+        ]
+    )

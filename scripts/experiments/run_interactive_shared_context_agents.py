@@ -6,10 +6,11 @@ import os
 import shutil
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict
+from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 try:
     from dotenv import load_dotenv
@@ -25,7 +26,7 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 from src.codex.parser import InteractiveWorkerAction, parse_interactive_worker_action
 from src.codex.prompts import build_interactive_worker_step_prompt
-from src.codex.runner import run_codex_exec
+from src.codex.runner import CodexRunResult, run_codex_exec, terminate_active_codex_processes
 from src.controller.patch_service import (
     find_problem_by_id,
     patch_submission_result_to_dict,
@@ -38,6 +39,145 @@ from src.shared_context.storage import append_note, get_notes, init_db
 
 DEFAULT_SUBSET_PATH = Path("outputs/putnam_small_ids.txt")
 AGENT_NOTE_TYPES = {"CLAIM", "TACTIC_TRIED", "FAIL", "LEMMA_CANDIDATE"}
+
+
+class EventLogger:
+    def __init__(
+        self,
+        *,
+        run_dir: Path,
+        budget: "TimeBudget",
+        progress: bool = False,
+        heartbeat_sec: float = 30,
+        problem_id: str | None = None,
+    ) -> None:
+        self.budget = budget
+        self.progress = progress
+        self.heartbeat_sec = float(heartbeat_sec)
+        self.problem_id = problem_id
+        self.events_path = run_dir / "events.jsonl"
+        self.event_counts: dict[str, int] = {}
+        self.last_event: str | None = None
+        self._last_event_elapsed = budget.elapsed()
+        self._handle: TextIO | None = None
+        try:
+            run_dir.mkdir(parents=True, exist_ok=True)
+            self._handle = self.events_path.open("w", encoding="utf-8")
+        except OSError as exc:
+            print(f"warning: could not open events.jsonl: {exc}", file=sys.stderr, flush=True)
+
+    def emit(self, event: str, **fields: object) -> None:
+        elapsed = self.budget.elapsed()
+        payload: dict[str, object] = {
+            "elapsed_sec": round(elapsed, 3),
+            "event": event,
+        }
+        if self.problem_id is not None and "problem_id" not in fields:
+            payload["problem_id"] = self.problem_id
+        payload.update(fields)
+        self.last_event = event
+        self.event_counts[event] = self.event_counts.get(event, 0) + 1
+        if self._handle is not None:
+            try:
+                self._handle.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+                self._handle.flush()
+            except (OSError, TypeError) as exc:
+                print(f"warning: could not write event {event!r}: {exc}", file=sys.stderr, flush=True)
+        if self.progress:
+            print(self._format_progress(payload), flush=True)
+        self._last_event_elapsed = elapsed
+
+    def seconds_since_last_event(self) -> float:
+        return max(0.0, self.budget.elapsed() - self._last_event_elapsed)
+
+    def close(self) -> None:
+        if self._handle is None:
+            return
+        try:
+            self._handle.close()
+        except OSError as exc:
+            print(f"warning: could not close events.jsonl: {exc}", file=sys.stderr, flush=True)
+
+    def _format_progress(self, payload: dict[str, object]) -> str:
+        elapsed = _format_float(payload.get("elapsed_sec"))
+        event = str(payload["event"])
+        parts = [f"[{elapsed}s]", event]
+        for key in (
+            "step",
+            "worker_id",
+            "action",
+            "note_type",
+            "note_seq",
+            "success",
+            "status",
+            "stopped_reason",
+            "reason",
+            "terminated_codex_processes",
+        ):
+            if key in payload and payload[key] is not None:
+                label = "worker" if key == "worker_id" else key
+                parts.append(f"{label}={_format_progress_value(payload[key])}")
+        if "active_workers" in payload:
+            parts.append(f"active_workers={_format_progress_value(payload['active_workers'])}")
+        if "waiting_workers" in payload:
+            parts.append(f"waiting={_format_progress_value(payload['waiting_workers'])}")
+        if "done_workers" in payload:
+            parts.append(f"done={_format_progress_value(payload['done_workers'])}")
+        if "remaining_sec" in payload and payload["remaining_sec"] is not None:
+            parts.append(f"remaining={_format_float(payload['remaining_sec'])}s")
+        if "elapsed_since_last_event" in payload:
+            parts.append(
+                f"elapsed_since_last_event={_format_float(payload['elapsed_since_last_event'])}s"
+            )
+        return " ".join(parts)
+
+
+def _format_progress_value(value: object) -> str:
+    if isinstance(value, (list, tuple, set)):
+        return ",".join(str(item) for item in value) or "-"
+    if isinstance(value, bool):
+        return str(value).lower()
+    return str(value)
+
+
+def _format_float(value: object) -> str:
+    try:
+        return f"{float(value):.1f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def emit_optional(
+    event_logger: EventLogger | None,
+    event: str,
+    **fields: object,
+) -> None:
+    if event_logger is not None:
+        event_logger.emit(event, **fields)
+
+
+def normalized_min_remaining_sec(value: float | int) -> float:
+    return max(0.0, float(value or 0))
+
+
+def has_enough_time_to_start_call(
+    budget: "TimeBudget",
+    min_remaining_sec: float | int,
+) -> bool:
+    remaining = budget.remaining()
+    if remaining is None:
+        return True
+    return remaining >= normalized_min_remaining_sec(min_remaining_sec)
+
+
+def context_request_limit_exceeded(count: int, limit: int) -> bool:
+    return limit >= 0 and count > limit
+
+
+def remaining_context_request_budget(count: int, limit: int) -> int | None:
+    if limit < 0:
+        return None
+    return max(0, limit - count)
 
 
 def main() -> int:
@@ -88,6 +228,17 @@ def main() -> int:
                 step_index=1,
                 current_context_text=first_context,
                 worker_history_text="",
+                worker_state={
+                    "actions": [],
+                    "context_request_count": 0,
+                    "patch_attempt_count": 0,
+                    "last_check_status": None,
+                    "last_error": None,
+                },
+                max_context_requests_per_worker=getattr(
+                    args, "max_context_requests_per_worker", 1
+                ),
+                shared_context_policy=getattr(args, "shared_context_policy", "legacy"),
             )
         )
         return 0
@@ -113,6 +264,13 @@ def main() -> int:
     return 0
 
 
+@dataclass(frozen=True)
+class WorkerStepReturn:
+    worker_id: str
+    action: InteractiveWorkerAction
+    codex_result: CodexRunResult | None = None
+
+
 def run_scheduler(
     *,
     args: argparse.Namespace,
@@ -132,6 +290,9 @@ def run_scheduler(
             "last_check_status": None,
             "last_error": None,
             "malformed_action_count": 0,
+            "context_request_count": 0,
+            "context_request_limit_exceeded_count": 0,
+            "patch_attempt_count": 0,
         }
         for worker_id in worker_ids
     }
@@ -142,65 +303,372 @@ def run_scheduler(
     final_proof_seq = None
     steps_completed = 0
     stopped_reason: str | None = None
+    interrupted = False
+    terminated_codex_processes = 0
+    min_remaining_sec_to_start_call = normalized_min_remaining_sec(
+        getattr(args, "min_remaining_sec_to_start_call", 30)
+    )
+    max_context_requests_per_worker = int(
+        getattr(args, "max_context_requests_per_worker", 1)
+    )
+    shared_context_policy = getattr(args, "shared_context_policy", "legacy")
+    event_logger = EventLogger(
+        run_dir=run_dir,
+        budget=budget,
+        progress=bool(args.progress),
+        heartbeat_sec=float(args.heartbeat_sec),
+        problem_id=problem.problem_id,
+    )
+    event_logger.emit(
+        "run_start",
+        problem_id=problem.problem_id,
+        num_workers=len(worker_ids),
+        max_steps=args.max_steps,
+        max_concurrency=args.max_concurrency,
+        time_budget_sec=args.time_budget_sec,
+        max_context_requests_per_worker=max_context_requests_per_worker,
+        min_remaining_sec_to_start_call=min_remaining_sec_to_start_call,
+        shared_context_policy=shared_context_policy,
+    )
 
-    for step_index in range(1, args.max_steps + 1):
-        if not budget.can_start_call():
-            stopped_reason = "time_budget_exceeded"
-            break
-        active_workers = [
-            worker_id for worker_id in worker_ids if states[worker_id]["active"]
-        ]
-        if not active_workers or success:
-            break
-        steps_completed = step_index
-        step_codex_timeout = budget.timeout_for(args.codex_timeout_sec)
-        if step_codex_timeout <= 0:
-            stopped_reason = "time_budget_exceeded"
-            break
+    try:
+        for step_index in range(1, args.max_steps + 1):
+            if not budget.can_start_call():
+                stopped_reason = "time_budget_exceeded"
+                break
+            active_workers = [
+                worker_id for worker_id in worker_ids if states[worker_id]["active"]
+            ]
+            if not active_workers or success:
+                break
+            steps_completed = step_index
+            if not has_enough_time_to_start_call(
+                budget, min_remaining_sec_to_start_call
+            ):
+                stopped_reason = "time_budget_exceeded"
+                event_logger.emit(
+                    "time_budget_low",
+                    phase="codex_launch",
+                    step=step_index,
+                    remaining_sec=budget.remaining(),
+                    min_remaining_sec_to_start_call=min_remaining_sec_to_start_call,
+                )
+                break
+            step_codex_timeout = budget.timeout_for(args.codex_timeout_sec)
+            if step_codex_timeout <= 0:
+                stopped_reason = "time_budget_exceeded"
+                break
 
-        jobs = []
-        with ThreadPoolExecutor(max_workers=args.max_concurrency) as pool:
-            for worker_id in active_workers:
-                context_text = pull_worker_context(db_path, problem.problem_id)
-                prompt = build_step_prompt(
-                    problem=problem,
+            event_logger.emit(
+                "step_start",
+                step=step_index,
+                active_workers=active_workers,
+                remaining_sec=budget.remaining(),
+            )
+            step_result = run_scheduler_step(
+                args=args,
+                api_key=api_key,
+                budget=budget,
+                putnam_root=putnam_root,
+                db_path=db_path,
+                run_dir=run_dir,
+                problem=problem,
+                states=states,
+                active_workers=active_workers,
+                step_index=step_index,
+                step_codex_timeout=step_codex_timeout,
+                max_context_requests_per_worker=max_context_requests_per_worker,
+                min_remaining_sec_to_start_call=min_remaining_sec_to_start_call,
+                shared_context_policy=shared_context_policy,
+                event_logger=event_logger,
+            )
+            total_codex_calls += step_result["codex_calls"]
+            total_lean_elapsed_sec += step_result["lean_elapsed_sec"]
+            if step_result["success"]:
+                success = True
+                final_verified_patch_seq = step_result["final_verified_patch_seq"]
+                final_proof_seq = step_result["final_proof_seq"]
+            stopped_reason = step_result["stopped_reason"] or stopped_reason
+            if success or stopped_reason == "time_budget_exceeded":
+                break
+    except KeyboardInterrupt:
+        interrupted = True
+        stopped_reason = "keyboard_interrupt"
+        event_logger.emit("codex_cleanup_start", reason="keyboard_interrupt")
+        terminated_codex_processes = terminate_active_codex_processes()
+        event_logger.emit(
+            "codex_cleanup_end",
+            reason="keyboard_interrupt",
+            terminated_codex_processes=terminated_codex_processes,
+        )
+        event_logger.emit(
+            "keyboard_interrupt",
+            terminated_codex_processes=terminated_codex_processes,
+        )
+
+    if stopped_reason is None:
+        stopped_reason = interactive_stopped_reason(
+            success=success,
+            budget_exhausted=budget.exhausted(),
+            steps_completed=steps_completed,
+            max_steps=args.max_steps,
+            any_active=any(states[worker_id]["active"] for worker_id in worker_ids),
+        )
+    event_logger.emit(
+        "run_end",
+        success=success,
+        stopped_reason=stopped_reason,
+        steps_completed=steps_completed,
+        wall_elapsed_sec=budget.elapsed(),
+    )
+    summary = {
+        "problem_id": problem.problem_id,
+        "num_workers": len(worker_ids),
+        "max_steps": args.max_steps,
+        "max_concurrency": args.max_concurrency,
+        "steps_completed": steps_completed,
+        "success": success,
+        "workers": {
+            worker_id: {
+                "actions": states[worker_id]["actions"],
+                "active": states[worker_id]["active"],
+                "last_check_status": states[worker_id]["last_check_status"],
+                "last_error": states[worker_id]["last_error"],
+                "malformed_action_count": states[worker_id]["malformed_action_count"],
+                "context_request_count": states[worker_id]["context_request_count"],
+                "context_request_limit_exceeded_count": states[worker_id][
+                    "context_request_limit_exceeded_count"
+                ],
+                "patch_attempt_count": states[worker_id]["patch_attempt_count"],
+            }
+            for worker_id in worker_ids
+        },
+        "worker_action_counts": {
+            worker_id: dict(Counter(str(action) for action in states[worker_id]["actions"]))
+            for worker_id in worker_ids
+        },
+        "patch_attempt_count": sum(
+            int(states[worker_id]["patch_attempt_count"])
+            for worker_id in worker_ids
+        ),
+        "workers_with_patch_attempt": sum(
+            1
+            for worker_id in worker_ids
+            if int(states[worker_id]["patch_attempt_count"]) > 0
+        ),
+        "workers_stopped_without_patch": sum(
+            1
+            for worker_id in worker_ids
+            if not states[worker_id]["active"]
+            and int(states[worker_id]["patch_attempt_count"]) == 0
+        ),
+        "malformed_action_count": sum(
+            int(states[worker_id]["malformed_action_count"])
+            for worker_id in worker_ids
+        ),
+        "context_request_limit_exceeded_count": sum(
+            int(states[worker_id]["context_request_limit_exceeded_count"])
+            for worker_id in worker_ids
+        ),
+        "time_budget_low_count": event_logger.event_counts.get("time_budget_low", 0),
+        "total_codex_calls": total_codex_calls,
+        "total_lean_elapsed_sec": total_lean_elapsed_sec,
+        "final_verified_patch_seq": final_verified_patch_seq,
+        "final_proof_seq": final_proof_seq,
+        "time_budget_sec": args.time_budget_sec,
+        "wall_elapsed_sec": budget.elapsed(),
+        "time_to_success_sec": budget.elapsed() if success else None,
+        "stopped_reason": stopped_reason,
+        "interrupted": interrupted,
+        "terminated_codex_processes": terminated_codex_processes,
+        "budget_exhausted": budget.exhausted() and not success,
+        "events_path": str(event_logger.events_path),
+        "progress_enabled": bool(args.progress),
+        "heartbeat_sec": args.heartbeat_sec,
+        "max_context_requests_per_worker": max_context_requests_per_worker,
+        "min_remaining_sec_to_start_call": min_remaining_sec_to_start_call,
+        "shared_context_policy": shared_context_policy,
+        "last_event": event_logger.last_event,
+        "event_counts": dict(event_logger.event_counts),
+    }
+    event_logger.close()
+    return summary
+
+
+def run_scheduler_step(
+    *,
+    args: argparse.Namespace,
+    api_key: str | None,
+    budget: "TimeBudget",
+    putnam_root: Path,
+    db_path: Path,
+    run_dir: Path,
+    problem: object,
+    states: dict[str, dict[str, Any]],
+    active_workers: list[str],
+    step_index: int,
+    step_codex_timeout: float,
+    max_context_requests_per_worker: int,
+    min_remaining_sec_to_start_call: float,
+    shared_context_policy: str,
+    event_logger: EventLogger,
+) -> dict[str, Any]:
+    total_codex_calls = 0
+    total_lean_elapsed_sec = 0.0
+    success = False
+    final_verified_patch_seq = None
+    final_proof_seq = None
+    stopped_reason: str | None = None
+    future_to_worker: dict[Future[WorkerStepReturn], str] = {}
+    done_workers: set[str] = set()
+    pending: set[Future[WorkerStepReturn]] = set()
+    pool = ThreadPoolExecutor(max_workers=args.max_concurrency)
+    interrupted = False
+    try:
+        for worker_id in active_workers:
+            if not has_enough_time_to_start_call(
+                budget, min_remaining_sec_to_start_call
+            ):
+                stopped_reason = "time_budget_exceeded"
+                event_logger.emit(
+                    "time_budget_low",
+                    phase="codex_launch",
+                    step=step_index,
                     worker_id=worker_id,
-                    step_index=step_index,
-                    current_context_text=context_text,
-                    worker_history_text=str(states[worker_id]["history"]),
+                    remaining_sec=budget.remaining(),
+                    min_remaining_sec_to_start_call=min_remaining_sec_to_start_call,
                 )
-                work_dir = (
-                    run_dir
-                    / "workers"
-                    / worker_id
-                    / f"step_{step_index:03d}"
-                    / "codex"
-                )
-                jobs.append(
-                    pool.submit(
-                        run_worker_step,
-                        args=args,
-                        api_key=api_key,
-                        prompt=prompt,
-                        work_dir=work_dir,
-                        timeout_sec=step_codex_timeout,
+                break
+            context_text = pull_worker_context(db_path, problem.problem_id)
+            prompt = build_step_prompt(
+                problem=problem,
+                worker_id=worker_id,
+                step_index=step_index,
+                current_context_text=context_text,
+                worker_history_text=str(states[worker_id]["history"]),
+                worker_state=states[worker_id],
+                max_context_requests_per_worker=max_context_requests_per_worker,
+                shared_context_policy=shared_context_policy,
+            )
+            work_dir = (
+                run_dir
+                / "workers"
+                / worker_id
+                / f"step_{step_index:03d}"
+                / "codex"
+            )
+            future = pool.submit(
+                run_worker_step,
+                args=args,
+                api_key=api_key,
+                prompt=prompt,
+                work_dir=work_dir,
+                timeout_sec=step_codex_timeout,
+            )
+            future_to_worker[future] = worker_id
+            total_codex_calls += 1
+            event_logger.emit(
+                "worker_launch",
+                step=step_index,
+                worker_id=worker_id,
+                timeout_sec=max(1, int(step_codex_timeout)),
+                remaining_sec=budget.remaining(),
+            )
+
+        pending = set(future_to_worker)
+        while pending:
+            done, pending = wait_for_worker_futures(
+                pending,
+                event_logger=event_logger,
+                step_index=step_index,
+                future_to_worker=future_to_worker,
+                done_workers=done_workers,
+                budget=budget,
+            )
+            for future in done:
+                expected_worker_id = future_to_worker[future]
+                try:
+                    worker_step = normalize_worker_step_return(future.result())
+                except KeyboardInterrupt:
+                    interrupted = True
+                    cancel_pending_futures(pending)
+                    raise
+                except Exception as exc:
+                    event_logger.emit(
+                        "worker_error",
+                        step=step_index,
+                        worker_id=expected_worker_id,
+                        status="worker_exception",
+                        message=str(exc),
                     )
-                )
-                total_codex_calls += 1
-
-            for future in as_completed(jobs):
-                worker_id, action = future.result()
-                action_result = handle_action(
-                    action=action,
+                    raise
+                worker_id = worker_step.worker_id
+                action = worker_step.action
+                result = worker_step.codex_result
+                done_workers.add(worker_id)
+                action_name = action.action or "PARSE_ERROR"
+                if result is not None and result.timed_out:
+                    event_logger.emit(
+                        "codex_timeout",
+                        step=step_index,
+                        worker_id=worker_id,
+                        timeout_sec=max(1, int(step_codex_timeout)),
+                        returncode=result.returncode,
+                    )
+                    event_logger.emit(
+                        "codex_cleanup_start",
+                        step=step_index,
+                        worker_id=worker_id,
+                        reason="timeout",
+                    )
+                    event_logger.emit(
+                        "codex_cleanup_end",
+                        step=step_index,
+                        worker_id=worker_id,
+                        reason="timeout",
+                        returncode=result.returncode,
+                    )
+                event_logger.emit(
+                    "worker_return",
+                    step=step_index,
                     worker_id=worker_id,
-                    step_index=step_index,
-                    states=states,
-                    putnam_root=putnam_root,
-                    db_path=db_path,
-                    run_dir=run_dir,
-                    problem=problem,
-                    budget=budget,
-                    lean_timeout_sec=args.lean_timeout_sec,
+                    action=action_name,
+                    errors_count=len(action.errors),
+                )
+                try:
+                    action_result = handle_action(
+                        action=action,
+                        worker_id=worker_id,
+                        step_index=step_index,
+                        states=states,
+                        putnam_root=putnam_root,
+                        db_path=db_path,
+                        run_dir=run_dir,
+                        problem=problem,
+                        budget=budget,
+                        lean_timeout_sec=args.lean_timeout_sec,
+                        max_context_requests_per_worker=max_context_requests_per_worker,
+                        min_remaining_sec_to_start_call=min_remaining_sec_to_start_call,
+                        event_logger=event_logger,
+                    )
+                except Exception as exc:
+                    event_logger.emit(
+                        "worker_error",
+                        step=step_index,
+                        worker_id=worker_id,
+                        action=action_name,
+                        status="action_exception",
+                        message=str(exc),
+                    )
+                    raise
+                event_logger.emit(
+                    "action_handled",
+                    step=step_index,
+                    worker_id=worker_id,
+                    action=action_result.get("action", action_name),
+                    result_event=action_result.get("event"),
+                    success=action_result.get("success"),
+                    stopped_reason=action_result.get("stopped_reason"),
                 )
                 write_action_json(
                     run_dir / "workers" / worker_id / f"step_{step_index:03d}",
@@ -218,46 +686,64 @@ def run_scheduler(
                     break
             if stopped_reason == "time_budget_exceeded" or success:
                 break
+    except KeyboardInterrupt:
+        interrupted = True
+        cancel_pending_futures(pending)
+        raise
+    finally:
+        pool.shutdown(wait=not interrupted, cancel_futures=interrupted)
 
-    if stopped_reason is None:
-        stopped_reason = interactive_stopped_reason(
-            success=success,
-            budget_exhausted=budget.exhausted(),
-            steps_completed=steps_completed,
-            max_steps=args.max_steps,
-            any_active=any(states[worker_id]["active"] for worker_id in worker_ids),
-        )
     return {
-        "problem_id": problem.problem_id,
-        "num_workers": len(worker_ids),
-        "max_steps": args.max_steps,
-        "max_concurrency": args.max_concurrency,
-        "steps_completed": steps_completed,
+        "codex_calls": total_codex_calls,
+        "lean_elapsed_sec": total_lean_elapsed_sec,
         "success": success,
-        "workers": {
-            worker_id: {
-                "actions": states[worker_id]["actions"],
-                "active": states[worker_id]["active"],
-                "last_check_status": states[worker_id]["last_check_status"],
-                "last_error": states[worker_id]["last_error"],
-                "malformed_action_count": states[worker_id]["malformed_action_count"],
-            }
-            for worker_id in worker_ids
-        },
-        "malformed_action_count": sum(
-            int(states[worker_id]["malformed_action_count"])
-            for worker_id in worker_ids
-        ),
-        "total_codex_calls": total_codex_calls,
-        "total_lean_elapsed_sec": total_lean_elapsed_sec,
         "final_verified_patch_seq": final_verified_patch_seq,
         "final_proof_seq": final_proof_seq,
-        "time_budget_sec": args.time_budget_sec,
-        "wall_elapsed_sec": budget.elapsed(),
-        "time_to_success_sec": budget.elapsed() if success else None,
         "stopped_reason": stopped_reason,
-        "budget_exhausted": budget.exhausted() and not success,
     }
+
+
+def cancel_pending_futures(pending: set[Future[WorkerStepReturn]]) -> None:
+    for future in pending:
+        future.cancel()
+
+
+def normalize_worker_step_return(value: object) -> WorkerStepReturn:
+    if isinstance(value, WorkerStepReturn):
+        return value
+    if isinstance(value, tuple) and len(value) == 2:
+        worker_id, action = value
+        return WorkerStepReturn(
+            worker_id=str(worker_id),
+            action=action,
+            codex_result=None,
+        )
+    raise TypeError(f"unexpected worker step return: {value!r}")
+
+
+def wait_for_worker_futures(
+    pending: set[Future[WorkerStepReturn]],
+    *,
+    event_logger: "EventLogger",
+    step_index: int,
+    future_to_worker: dict[Future[WorkerStepReturn], str],
+    done_workers: set[str],
+    budget: "TimeBudget",
+) -> tuple[set[Future[WorkerStepReturn]], set[Future[WorkerStepReturn]]]:
+    heartbeat_sec = event_logger.heartbeat_sec
+    timeout = heartbeat_sec if heartbeat_sec > 0 else None
+    done, still_pending = wait(pending, timeout=timeout, return_when=FIRST_COMPLETED)
+    if not done and still_pending and heartbeat_sec > 0:
+        waiting_workers = sorted(future_to_worker[future] for future in still_pending)
+        event_logger.emit(
+            "heartbeat",
+            step=step_index,
+            waiting_workers=waiting_workers,
+            done_workers=sorted(done_workers),
+            elapsed_since_last_event=event_logger.seconds_since_last_event(),
+            remaining_sec=budget.remaining(),
+        )
+    return done, still_pending
 
 
 def run_worker_step(
@@ -267,7 +753,7 @@ def run_worker_step(
     prompt: str,
     work_dir: Path,
     timeout_sec: float | int,
-) -> tuple[str, InteractiveWorkerAction]:
+) -> WorkerStepReturn:
     worker_id = work_dir.parents[1].name
     result = run_codex_exec(
         prompt=prompt,
@@ -280,7 +766,11 @@ def run_worker_step(
         timeout_sec=max(1, int(timeout_sec)),
     )
     text = result.last_message or result.stdout or result.stderr or result.combined_output or ""
-    return worker_id, parse_interactive_worker_action(text)
+    return WorkerStepReturn(
+        worker_id=worker_id,
+        action=parse_interactive_worker_action(text),
+        codex_result=result,
+    )
 
 
 def handle_action(
@@ -295,17 +785,84 @@ def handle_action(
     problem: object,
     budget: "TimeBudget",
     lean_timeout_sec: int,
+    max_context_requests_per_worker: int = 1,
+    min_remaining_sec_to_start_call: float = 30,
+    event_logger: EventLogger | None = None,
 ) -> dict[str, Any]:
     action_name = action.action or "PARSE_ERROR"
     states[worker_id]["actions"].append(action_name)
     append_history(states, worker_id, step_index, action)
 
     if action_name == "REQUEST_CONTEXT":
-        latest_context = handle_request_context(db_path, problem.problem_id, states[worker_id])
-        return {"action": action_name, "context_chars": len(latest_context)}
+        worker_state = states[worker_id]
+        worker_state["context_request_count"] = int(
+            worker_state.get("context_request_count", 0)
+        ) + 1
+        context_request_count = int(worker_state["context_request_count"])
+        remaining_context_requests = remaining_context_request_budget(
+            context_request_count, max_context_requests_per_worker
+        )
+        if context_request_limit_exceeded(
+            context_request_count, max_context_requests_per_worker
+        ):
+            worker_state["context_request_limit_exceeded_count"] = int(
+                worker_state.get("context_request_limit_exceeded_count", 0)
+            ) + 1
+            message = (
+                "REQUEST_CONTEXT limit exceeded. Do not request context again; "
+                "next step must choose SUBMIT_NOTE, SUBMIT_PATCH, or STOP."
+            )
+            worker_state["history"] += f"\nController: {message}"
+            emit_optional(
+                event_logger,
+                "request_context_ignored",
+                step=step_index,
+                worker_id=worker_id,
+                action=action_name,
+                context_request_count=context_request_count,
+                max_context_requests_per_worker=max_context_requests_per_worker,
+                remaining_context_requests=remaining_context_requests,
+                reason="context_request_limit_exceeded",
+            )
+            return {
+                "action": action_name,
+                "ignored": True,
+                "reason": "context_request_limit_exceeded",
+                "context_request_count": context_request_count,
+                "max_context_requests_per_worker": max_context_requests_per_worker,
+                "remaining_context_requests": remaining_context_requests,
+            }
+        latest_context = handle_request_context(db_path, problem.problem_id, worker_state)
+        emit_optional(
+            event_logger,
+            "request_context_handled",
+            step=step_index,
+            worker_id=worker_id,
+            action=action_name,
+            context_chars=len(latest_context),
+            context_request_count=context_request_count,
+            max_context_requests_per_worker=max_context_requests_per_worker,
+            remaining_context_requests=remaining_context_requests,
+        )
+        return {
+            "action": action_name,
+            "context_chars": len(latest_context),
+            "context_request_count": context_request_count,
+            "max_context_requests_per_worker": max_context_requests_per_worker,
+            "remaining_context_requests": remaining_context_requests,
+        }
 
     if action_name == "SUBMIT_NOTE":
         if action.note_type not in AGENT_NOTE_TYPES:
+            emit_optional(
+                event_logger,
+                "note_ignored",
+                step=step_index,
+                worker_id=worker_id,
+                action=action_name,
+                note_type=action.note_type,
+                reason="invalid_type",
+            )
             return record_malformed_action(
                 states,
                 worker_id,
@@ -315,6 +872,15 @@ def handle_action(
             )
         note_content = (action.note_content or "").strip()
         if not note_content:
+            emit_optional(
+                event_logger,
+                "note_ignored",
+                step=step_index,
+                worker_id=worker_id,
+                action=action_name,
+                note_type=action.note_type,
+                reason="empty_content",
+            )
             return record_malformed_action(
                 states,
                 worker_id,
@@ -336,6 +902,16 @@ def handle_action(
                 writer_role="agent",
             )
         except ValueError as exc:
+            emit_optional(
+                event_logger,
+                "note_ignored",
+                step=step_index,
+                worker_id=worker_id,
+                action=action_name,
+                note_type=action.note_type,
+                reason="write_error",
+                message=str(exc),
+            )
             return record_malformed_action(
                 states,
                 worker_id,
@@ -343,11 +919,29 @@ def handle_action(
                 "SUBMIT_NOTE_WRITE_ERROR_IGNORED",
                 f"SUBMIT_NOTE write error ignored: {exc}",
             )
+        emit_optional(
+            event_logger,
+            "note_admitted",
+            step=step_index,
+            worker_id=worker_id,
+            action=action_name,
+            note_type=action.note_type,
+            note_seq=saved.seq,
+        )
         return {"action": action_name, "note_seq": saved.seq}
 
     if action_name == "SUBMIT_PATCH":
         proof_patch = (action.proof_patch or "").strip()
         if not proof_patch:
+            emit_optional(
+                event_logger,
+                "worker_error",
+                step=step_index,
+                worker_id=worker_id,
+                action=action_name,
+                status="empty_patch",
+                message="empty SUBMIT_PATCH ignored",
+            )
             return record_malformed_action(
                 states,
                 worker_id,
@@ -355,22 +949,79 @@ def handle_action(
                 "SUBMIT_PATCH_EMPTY_IGNORED",
                 "empty SUBMIT_PATCH ignored",
             )
-        if not budget.can_start_call():
-            return {"action": action_name, "stopped_reason": "time_budget_exceeded"}
+        min_remaining_sec_to_start_call = normalized_min_remaining_sec(
+            min_remaining_sec_to_start_call
+        )
+        if not budget.can_start_call() or not has_enough_time_to_start_call(
+            budget, min_remaining_sec_to_start_call
+        ):
+            emit_optional(
+                event_logger,
+                "time_budget_low",
+                phase="lean_submit",
+                step=step_index,
+                worker_id=worker_id,
+                remaining_sec=budget.remaining(),
+                min_remaining_sec_to_start_call=min_remaining_sec_to_start_call,
+            )
+            return {
+                "action": action_name,
+                "stopped_reason": "time_budget_exceeded",
+                "skipped": True,
+                "reason": "insufficient_remaining_time_for_lean",
+            }
         effective_lean_timeout = budget.timeout_for(lean_timeout_sec)
         if effective_lean_timeout <= 0:
             return {"action": action_name, "stopped_reason": "time_budget_exceeded"}
-        submit_result = submit_patch(
-            putnam_root=putnam_root,
-            db_path=db_path,
-            problem_id=problem.problem_id,
+        timeout_sec = max(1, int(effective_lean_timeout))
+        states[worker_id]["patch_attempt_count"] = int(
+            states[worker_id].get("patch_attempt_count", 0)
+        ) + 1
+        emit_optional(
+            event_logger,
+            "patch_submit_start",
+            step=step_index,
             worker_id=worker_id,
-            proof_patch=proof_patch,
-            run_dir=run_dir,
-            timeout_sec=max(1, int(effective_lean_timeout)),
+            action=action_name,
+            timeout_sec=timeout_sec,
         )
+        try:
+            submit_result = submit_patch(
+                putnam_root=putnam_root,
+                db_path=db_path,
+                problem_id=problem.problem_id,
+                worker_id=worker_id,
+                proof_patch=proof_patch,
+                run_dir=run_dir,
+                timeout_sec=timeout_sec,
+            )
+        except Exception as exc:
+            emit_optional(
+                event_logger,
+                "patch_submit_end",
+                step=step_index,
+                worker_id=worker_id,
+                action=action_name,
+                success=False,
+                status="exception",
+                message=str(exc),
+            )
+            raise
         result_dict = patch_submission_result_to_dict(submit_result)
         states[worker_id]["last_check_status"] = submit_result.check_status
+        emit_optional(
+            event_logger,
+            "patch_submit_end",
+            step=step_index,
+            worker_id=worker_id,
+            action=action_name,
+            success=submit_result.success,
+            status=submit_result.check_status,
+            returncode=submit_result.returncode,
+            lean_elapsed_sec=submit_result.elapsed_sec,
+            verified_patch_seq=submit_result.verified_patch_seq,
+            final_proof_seq=submit_result.final_proof_seq,
+        )
         return {
             "action": action_name,
             "success": submit_result.success,
@@ -382,8 +1033,24 @@ def handle_action(
 
     if action_name == "STOP":
         states[worker_id]["active"] = False
+        emit_optional(
+            event_logger,
+            "worker_stop",
+            step=step_index,
+            worker_id=worker_id,
+            action=action_name,
+        )
         return {"action": action_name}
 
+    emit_optional(
+        event_logger,
+        "worker_error",
+        step=step_index,
+        worker_id=worker_id,
+        action=action_name,
+        status="parse_error",
+        message="; ".join(action.errors),
+    )
     return {"action": action_name, "errors": action.errors}
 
 
@@ -429,7 +1096,11 @@ def build_step_prompt(
     step_index: int,
     current_context_text: str,
     worker_history_text: str,
+    worker_state: dict[str, Any] | None = None,
+    max_context_requests_per_worker: int = 1,
+    shared_context_policy: str = "legacy",
 ) -> str:
+    worker_state = worker_state or {}
     return build_interactive_worker_step_prompt(
         problem_id=problem.problem_id,
         theorem_name=problem.theorem_name,
@@ -440,6 +1111,13 @@ def build_step_prompt(
         step_index=step_index,
         current_context_text=current_context_text,
         worker_history_text=worker_history_text,
+        max_context_requests_per_worker=max_context_requests_per_worker,
+        context_request_count=int(worker_state.get("context_request_count", 0)),
+        patch_attempt_count=int(worker_state.get("patch_attempt_count", 0)),
+        previous_actions=[str(action) for action in worker_state.get("actions", [])],
+        last_check_status=worker_state.get("last_check_status"),
+        last_error=worker_state.get("last_error"),
+        shared_context_policy=shared_context_policy,
     )
 
 
@@ -516,6 +1194,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--codex-timeout-sec", type=int, default=600)
     parser.add_argument("--lean-timeout-sec", type=int, default=180)
     parser.add_argument("--time-budget-sec", type=float, default=0)
+    parser.add_argument("--progress", action="store_true")
+    parser.add_argument("--heartbeat-sec", type=float, default=30)
+    parser.add_argument("--max-context-requests-per-worker", type=int, default=1)
+    parser.add_argument("--min-remaining-sec-to-start-call", type=float, default=30)
+    parser.add_argument(
+        "--shared-context-policy",
+        choices=("legacy", "balanced", "aggressive"),
+        default="legacy",
+    )
     parser.add_argument("--fresh", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
