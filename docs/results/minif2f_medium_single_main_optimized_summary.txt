@@ -1,0 +1,44 @@
+========== single-main optimized batch summary ==========
+run root: runs/minif2f_medium_batch_single_main_optimized_2rounds
+total problems: 6
+success: 5
+success rate: 83.33%
+
+---------- time / cost ----------
+total wall time, summed over problems: 1288.34s
+avg wall_elapsed per problem: 214.72s
+avg time_to_success among solved: 201.88s
+total codex calls: 32
+avg codex calls per problem: 5.33
+avg rounds completed per problem: 1.33
+
+---------- stopped_reason by problem ----------
+success: 5
+max_rounds_reached: 1
+
+---------- check_status by round ----------
+checked by Lean and passed: 5
+checked by Lean and failed: 3
+
+---------- stopped_reason by round ----------
+None: 5
+lean_check_failed: 3
+
+---------- common error categories ----------
+parse issue: 5
+no goals: 2
+
+---------- per-problem result ----------
+minif2f_medium_amc12a_2003_p1, success=False, rounds=2, time=None, wall=278.92783095699997, codex_calls=8, stopped=max_rounds_reached
+minif2f_medium_amc12b_2003_p9, success=True, rounds=1, time=107.44043638100084, wall=107.44044144000145, codex_calls=4, stopped=success
+minif2f_medium_mathd_algebra_116, success=True, rounds=1, time=155.70508830199833, wall=155.70511003299907, codex_calls=4, stopped=success
+minif2f_medium_mathd_numbertheory_109, success=True, rounds=2, time=404.72891672100013, wall=404.7289199019997, codex_calls=8, stopped=success
+minif2f_medium_mathd_numbertheory_149, success=True, rounds=1, time=181.84389514500072, wall=181.84389932299928, codex_calls=4, stopped=success
+minif2f_medium_mathd_numbertheory_211, success=True, rounds=1, time=159.6931556039999, wall=159.69315892799932, codex_calls=4, stopped=success
+
+saved files:
+- runs/minif2f_medium_batch_single_main_optimized_2rounds/stats/summary.txt
+- runs/minif2f_medium_batch_single_main_optimized_2rounds/stats/problem_summary.csv
+- runs/minif2f_medium_batch_single_main_optimized_2rounds/stats/round_summary.csv
+- runs/minif2f_medium_batch_single_main_optimized_2rounds/stats/problem_summary.json
+- runs/minif2f_medium_batch_single_main_optimized_2rounds/stats/round_summary.json

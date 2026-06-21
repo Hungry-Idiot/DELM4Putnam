@@ -69,6 +69,7 @@ def submit_patch(
         run_dir=run_dir / worker_id / "attempts",
         attempt_name=attempt_name,
         timeout_sec=timeout_sec,
+        original_source=problem.source,
     )
     check_status = classify_check_result(check_result)
     error_messages = _error_messages(check_result)

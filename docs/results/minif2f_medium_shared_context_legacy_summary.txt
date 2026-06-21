@@ -1,0 +1,12 @@
+========== batch summary ==========
+total problems: 6
+success: 6
+success rate: 100.00%
+total wall time, summed over problems: 356.29s
+avg time_to_success among solved: 59.38s
+avg wall_elapsed per problem: 59.38s
+total context requests: 0
+
+saved txt: runs/minif2f_medium_batch_2w_shared_context_legacy_restore/stats/summary.txt
+saved csv: runs/minif2f_medium_batch_2w_shared_context_legacy_restore/stats/summary.csv
+saved json: runs/minif2f_medium_batch_2w_shared_context_legacy_restore/stats/summary.json

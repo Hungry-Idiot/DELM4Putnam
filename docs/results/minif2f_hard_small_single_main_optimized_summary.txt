@@ -1,0 +1,48 @@
+========== hard-small single-main optimized batch summary ==========
+run root: runs/minif2f_hard_small_batch_single_main_optimized_2rounds
+total problems: 8
+success: 5
+success rate: 62.50%
+
+---------- time / cost ----------
+total wall time, summed over problems: 3588.82s
+avg wall_elapsed per problem: 448.60s
+avg time_to_success among solved: 192.92s
+total codex calls: 44
+avg codex calls per problem: 5.50
+avg rounds completed per problem: 1.38
+
+---------- stopped_reason by problem ----------
+success: 5
+max_rounds_reached: 3
+
+---------- check_status by round ----------
+checked by Lean and failed: 6
+checked by Lean and passed: 5
+
+---------- stopped_reason by round ----------
+lean_check_failed: 6
+None: 5
+
+---------- common error categories ----------
+parse issue: 5
+type mismatch: 5
+simp issue: 2
+no goals: 1
+
+---------- per-problem result ----------
+minif2f_hard_small_amc12_2001_p9, success=True, rounds=1, time=81.83829597699992, wall=81.83829910099985, codex_calls=4, stopped=success
+minif2f_hard_small_amc12a_2009_p9, success=True, rounds=1, time=161.15055125699996, wall=161.1505563889998, codex_calls=4, stopped=success
+minif2f_hard_small_amc12a_2015_p10, success=True, rounds=1, time=385.076896821, wall=385.07689878299993, codex_calls=4, stopped=success
+minif2f_hard_small_amc12a_2019_p9, success=False, rounds=2, time=None, wall=846.1942012909999, codex_calls=8, stopped=max_rounds_reached
+minif2f_hard_small_mathd_algebra_140, success=True, rounds=1, time=189.4410096759998, wall=189.44101234299978, codex_calls=4, stopped=success
+minif2f_hard_small_mathd_algebra_73, success=True, rounds=1, time=147.11725688299975, wall=147.1172593189999, codex_calls=4, stopped=success
+minif2f_hard_small_mathd_numbertheory_13, success=False, rounds=2, time=None, wall=696.155604733, codex_calls=8, stopped=max_rounds_reached
+minif2f_hard_small_mathd_numbertheory_780, success=False, rounds=2, time=None, wall=1081.8472577890002, codex_calls=8, stopped=max_rounds_reached
+
+saved files:
+- runs/minif2f_hard_small_batch_single_main_optimized_2rounds/stats/summary.txt
+- runs/minif2f_hard_small_batch_single_main_optimized_2rounds/stats/problem_summary.csv
+- runs/minif2f_hard_small_batch_single_main_optimized_2rounds/stats/round_summary.csv
+- runs/minif2f_hard_small_batch_single_main_optimized_2rounds/stats/problem_summary.json
+- runs/minif2f_hard_small_batch_single_main_optimized_2rounds/stats/round_summary.json

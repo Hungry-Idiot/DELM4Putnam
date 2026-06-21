@@ -85,9 +85,11 @@ def check_patch_for_problem(
     run_dir: Path,
     attempt_name: str = "attempt_001.lean",
     timeout_sec: int = 180,
+    original_source: str | None = None,
 ) -> LeanCheckResult:
     start = time.perf_counter()
-    original_source = problem_path.read_text(encoding="utf-8")
+    if original_source is None:
+        original_source = problem_path.read_text(encoding="utf-8")
     attempt_path = run_dir / attempt_name
     make_attempt_file(original_source, proof_patch, attempt_path)
     absolute_attempt_path = attempt_path.resolve()

@@ -184,6 +184,14 @@ def main() -> int:
     args = parse_args()
     if args.max_concurrency is None:
         args.max_concurrency = args.num_workers
+    if (
+        getattr(args, "shared_context_policy", "legacy") == "event_pull"
+        and int(getattr(args, "max_context_requests_per_worker", 1)) < 1
+    ):
+        raise SystemExit(
+            "--shared-context-policy event_pull requires "
+            "--max-context-requests-per-worker >= 1."
+        )
 
     putnam_root = Path(args.putnam_root)
     db_path = Path(args.db)
@@ -209,16 +217,28 @@ def main() -> int:
         print(f"model: {args.model or '(not set)'}")
         print(f"API key will be read from env var: {args.api_key_env}")
         print(f"time_budget_sec: {args.time_budget_sec:g}")
+        print(f"shared_context_policy: {args.shared_context_policy}")
+        print(
+            f"max_context_requests_per_worker: "
+            f"{args.max_context_requests_per_worker}"
+        )
         print(f"wall-clock budget mode: {budget_mode(args.time_budget_sec)}")
         if args.time_budget_sec > 0:
             print(f"This run will stop after {args.time_budget_sec:g} seconds unless solved earlier.")
         print("For parallel architecture comparison, use different --run-dir and --db for each architecture to avoid conflicts.")
         print("Shared Context mode: worker")
-        print(
-            "Interactive semantics: each worker step pulls latest committed worker "
-            "context before prompting; REQUEST_CONTEXT triggers another latest pull "
-            "for the next step."
-        )
+        if args.shared_context_policy in {"event_pull", "event_pull_soft"}:
+            print(
+                "Interactive semantics: event_pull policies do not automatically "
+                "inject full Shared Context into each prompt. Workers must use "
+                "REQUEST_CONTEXT to read failure details."
+            )
+        else:
+            print(
+                "Interactive semantics: each worker step pulls latest committed worker "
+                "context before prompting; REQUEST_CONTEXT triggers another latest pull "
+                "for the next step."
+            )
         print()
         print("A1 step 1 prompt")
         print(
@@ -226,7 +246,9 @@ def main() -> int:
                 problem=problem,
                 worker_id="A1",
                 step_index=1,
-                current_context_text=first_context,
+                current_context_text=prompt_context_for_policy(
+                    first_context, getattr(args, "shared_context_policy", "legacy")
+                ),
                 worker_history_text="",
                 worker_state={
                     "actions": [],
@@ -234,6 +256,15 @@ def main() -> int:
                     "patch_attempt_count": 0,
                     "last_check_status": None,
                     "last_error": None,
+                    "force_context_request": False,
+                    "force_context_request_after_step": None,
+                    "pending_context_note_seq": None,
+                    "last_seen_context_seq": None,
+                    "event_context_request_count": 0,
+                    "soft_context_available": False,
+                    "pending_soft_context_note_seq": None,
+                    "soft_context_notice_after_step": None,
+                    "soft_context_notice_count": 0,
                 },
                 max_context_requests_per_worker=getattr(
                     args, "max_context_requests_per_worker", 1
@@ -293,6 +324,15 @@ def run_scheduler(
             "context_request_count": 0,
             "context_request_limit_exceeded_count": 0,
             "patch_attempt_count": 0,
+            "force_context_request": False,
+            "force_context_request_after_step": None,
+            "pending_context_note_seq": None,
+            "last_seen_context_seq": None,
+            "event_context_request_count": 0,
+            "soft_context_available": False,
+            "pending_soft_context_note_seq": None,
+            "soft_context_notice_after_step": None,
+            "soft_context_notice_count": 0,
         }
         for worker_id in worker_ids
     }
@@ -440,6 +480,27 @@ def run_scheduler(
                     "context_request_limit_exceeded_count"
                 ],
                 "patch_attempt_count": states[worker_id]["patch_attempt_count"],
+                "force_context_request": states[worker_id]["force_context_request"],
+                "force_context_request_after_step": states[worker_id][
+                    "force_context_request_after_step"
+                ],
+                "pending_context_note_seq": states[worker_id][
+                    "pending_context_note_seq"
+                ],
+                "last_seen_context_seq": states[worker_id]["last_seen_context_seq"],
+                "event_context_request_count": states[worker_id][
+                    "event_context_request_count"
+                ],
+                "soft_context_available": states[worker_id]["soft_context_available"],
+                "pending_soft_context_note_seq": states[worker_id][
+                    "pending_soft_context_note_seq"
+                ],
+                "soft_context_notice_after_step": states[worker_id][
+                    "soft_context_notice_after_step"
+                ],
+                "soft_context_notice_count": states[worker_id][
+                    "soft_context_notice_count"
+                ],
             }
             for worker_id in worker_ids
         },
@@ -471,6 +532,35 @@ def run_scheduler(
             for worker_id in worker_ids
         ),
         "time_budget_low_count": event_logger.event_counts.get("time_budget_low", 0),
+        "failure_note_count": event_logger.event_counts.get("failure_note_admitted", 0),
+        "event_context_pull_required_count": event_logger.event_counts.get(
+            "event_context_pull_required", 0
+        ),
+        "event_context_pull_handled_count": event_logger.event_counts.get(
+            "event_context_pull_handled", 0
+        ),
+        "forced_context_request_missed_count": event_logger.event_counts.get(
+            "forced_context_request_missed", 0
+        ),
+        "soft_context_pull_available_count": event_logger.event_counts.get(
+            "soft_context_pull_available", 0
+        ),
+        "soft_context_pull_handled_count": event_logger.event_counts.get(
+            "soft_context_pull_handled", 0
+        ),
+        "soft_context_pull_bypassed_count": event_logger.event_counts.get(
+            "soft_context_pull_declined_or_bypassed", 0
+        ),
+        "soft_context_pull_skipped_due_to_limit_count": event_logger.event_counts.get(
+            "soft_context_pull_skipped_due_to_limit", 0
+        ),
+        "soft_context_pull_skipped_due_to_budget_count": event_logger.event_counts.get(
+            "soft_context_pull_skipped_due_to_budget", 0
+        ),
+        "total_event_context_requests": sum(
+            int(states[worker_id]["event_context_request_count"])
+            for worker_id in worker_ids
+        ),
         "total_codex_calls": total_codex_calls,
         "total_lean_elapsed_sec": total_lean_elapsed_sec,
         "final_verified_patch_seq": final_verified_patch_seq,
@@ -539,7 +629,10 @@ def run_scheduler_step(
                     min_remaining_sec_to_start_call=min_remaining_sec_to_start_call,
                 )
                 break
-            context_text = pull_worker_context(db_path, problem.problem_id)
+            context_text = prompt_context_for_policy(
+                pull_worker_context(db_path, problem.problem_id),
+                shared_context_policy,
+            )
             prompt = build_step_prompt(
                 problem=problem,
                 worker_id=worker_id,
@@ -649,6 +742,7 @@ def run_scheduler_step(
                         lean_timeout_sec=args.lean_timeout_sec,
                         max_context_requests_per_worker=max_context_requests_per_worker,
                         min_remaining_sec_to_start_call=min_remaining_sec_to_start_call,
+                        shared_context_policy=shared_context_policy,
                         event_logger=event_logger,
                     )
                 except Exception as exc:
@@ -787,14 +881,67 @@ def handle_action(
     lean_timeout_sec: int,
     max_context_requests_per_worker: int = 1,
     min_remaining_sec_to_start_call: float = 30,
+    shared_context_policy: str = "legacy",
     event_logger: EventLogger | None = None,
 ) -> dict[str, Any]:
     action_name = action.action or "PARSE_ERROR"
     states[worker_id]["actions"].append(action_name)
     append_history(states, worker_id, step_index, action)
+    worker_state = states[worker_id]
+
+    if (
+        shared_context_policy == "event_pull"
+        and worker_state.get("force_context_request")
+        and (
+            worker_state.get("force_context_request_after_step") is None
+            or step_index >= int(worker_state["force_context_request_after_step"])
+        )
+        and action_name != "REQUEST_CONTEXT"
+    ):
+        message = (
+            "You must request Shared Context before further actions because "
+            "another worker's patch failed."
+        )
+        emit_optional(
+            event_logger,
+            "forced_context_request_missed",
+            step=step_index,
+            worker_id=worker_id,
+            action=action_name,
+            pending_context_note_seq=worker_state.get("pending_context_note_seq"),
+        )
+        return record_malformed_action(
+            states,
+            worker_id,
+            action_name,
+            "FORCED_CONTEXT_REQUEST_MISSED",
+            message,
+        )
+
+    if (
+        shared_context_policy == "event_pull_soft"
+        and worker_state.get("soft_context_available")
+        and (
+            worker_state.get("soft_context_notice_after_step") is None
+            or step_index >= int(worker_state["soft_context_notice_after_step"])
+        )
+        and action_name in {"SUBMIT_PATCH", "SUBMIT_NOTE", "STOP"}
+    ):
+        emit_optional(
+            event_logger,
+            "soft_context_pull_declined_or_bypassed",
+            step=step_index,
+            worker_id=worker_id,
+            action=action_name,
+            pending_soft_context_note_seq=worker_state.get(
+                "pending_soft_context_note_seq"
+            ),
+        )
+        worker_state["soft_context_available"] = False
+        worker_state["pending_soft_context_note_seq"] = None
+        worker_state["soft_context_notice_after_step"] = None
 
     if action_name == "REQUEST_CONTEXT":
-        worker_state = states[worker_id]
         worker_state["context_request_count"] = int(
             worker_state.get("context_request_count", 0)
         ) + 1
@@ -805,6 +952,23 @@ def handle_action(
         if context_request_limit_exceeded(
             context_request_count, max_context_requests_per_worker
         ):
+            if shared_context_policy == "event_pull_soft" and worker_state.get(
+                "soft_context_available"
+            ):
+                emit_optional(
+                    event_logger,
+                    "soft_context_pull_skipped_due_to_limit",
+                    step=step_index,
+                    worker_id=worker_id,
+                    pending_soft_context_note_seq=worker_state.get(
+                        "pending_soft_context_note_seq"
+                    ),
+                    context_request_count=context_request_count,
+                    max_context_requests_per_worker=max_context_requests_per_worker,
+                )
+                worker_state["soft_context_available"] = False
+                worker_state["pending_soft_context_note_seq"] = None
+                worker_state["soft_context_notice_after_step"] = None
             worker_state["context_request_limit_exceeded_count"] = int(
                 worker_state.get("context_request_limit_exceeded_count", 0)
             ) + 1
@@ -833,6 +997,50 @@ def handle_action(
                 "remaining_context_requests": remaining_context_requests,
             }
         latest_context = handle_request_context(db_path, problem.problem_id, worker_state)
+        handled_pending_seq = worker_state.get("pending_context_note_seq")
+        if shared_context_policy == "event_pull" and worker_state.get(
+            "force_context_request"
+        ):
+            worker_state["force_context_request"] = False
+            worker_state["force_context_request_after_step"] = None
+            worker_state["last_seen_context_seq"] = handled_pending_seq
+            worker_state["pending_context_note_seq"] = None
+            worker_state["event_context_request_count"] = int(
+                worker_state.get("event_context_request_count", 0)
+            ) + 1
+            emit_optional(
+                event_logger,
+                "event_context_pull_handled",
+                step=step_index,
+                worker_id=worker_id,
+                pending_context_note_seq=handled_pending_seq,
+                context_chars=len(latest_context),
+                event_context_request_count=worker_state[
+                    "event_context_request_count"
+                ],
+            )
+        if shared_context_policy == "event_pull_soft" and worker_state.get(
+            "soft_context_available"
+        ):
+            handled_soft_seq = worker_state.get("pending_soft_context_note_seq")
+            worker_state["soft_context_available"] = False
+            worker_state["pending_soft_context_note_seq"] = None
+            worker_state["soft_context_notice_after_step"] = None
+            worker_state["last_seen_context_seq"] = handled_soft_seq
+            worker_state["event_context_request_count"] = int(
+                worker_state.get("event_context_request_count", 0)
+            ) + 1
+            emit_optional(
+                event_logger,
+                "soft_context_pull_handled",
+                step=step_index,
+                worker_id=worker_id,
+                pending_soft_context_note_seq=handled_soft_seq,
+                context_chars=len(latest_context),
+                event_context_request_count=worker_state[
+                    "event_context_request_count"
+                ],
+            )
         emit_optional(
             event_logger,
             "request_context_handled",
@@ -1009,6 +1217,10 @@ def handle_action(
             raise
         result_dict = patch_submission_result_to_dict(submit_result)
         states[worker_id]["last_check_status"] = submit_result.check_status
+        if not submit_result.success:
+            states[worker_id]["last_error"] = "; ".join(
+                submit_result.error_messages[:3]
+            )
         emit_optional(
             event_logger,
             "patch_submit_end",
@@ -1022,6 +1234,40 @@ def handle_action(
             verified_patch_seq=submit_result.verified_patch_seq,
             final_proof_seq=submit_result.final_proof_seq,
         )
+        failure_note_seq = None
+        if shared_context_policy in {"event_pull", "event_pull_soft"} and not submit_result.success:
+            failure_note = admit_failure_note(
+                db_path=db_path,
+                problem_id=problem.problem_id,
+                failed_worker_id=worker_id,
+                step_index=step_index,
+                proof_patch=proof_patch,
+                submit_result=submit_result,
+                event_logger=event_logger,
+            )
+            failure_note_seq = failure_note.seq
+            if shared_context_policy == "event_pull":
+                mark_event_context_pull_required(
+                    states=states,
+                    failed_worker_id=worker_id,
+                    step_index=step_index,
+                    note_seq=failure_note.seq,
+                    max_context_requests_per_worker=max_context_requests_per_worker,
+                    budget=budget,
+                    min_remaining_sec_to_start_call=min_remaining_sec_to_start_call,
+                    event_logger=event_logger,
+                )
+            elif shared_context_policy == "event_pull_soft":
+                mark_soft_context_pull_available(
+                    states=states,
+                    failed_worker_id=worker_id,
+                    step_index=step_index,
+                    note_seq=failure_note.seq,
+                    max_context_requests_per_worker=max_context_requests_per_worker,
+                    budget=budget,
+                    min_remaining_sec_to_start_call=min_remaining_sec_to_start_call,
+                    event_logger=event_logger,
+                )
         return {
             "action": action_name,
             "success": submit_result.success,
@@ -1029,10 +1275,17 @@ def handle_action(
             "verified_patch_seq": submit_result.verified_patch_seq,
             "final_proof_seq": submit_result.final_proof_seq,
             "submit_result": result_dict,
+            "failure_note_seq": failure_note_seq,
         }
 
     if action_name == "STOP":
         states[worker_id]["active"] = False
+        states[worker_id]["force_context_request"] = False
+        states[worker_id]["force_context_request_after_step"] = None
+        states[worker_id]["pending_context_note_seq"] = None
+        states[worker_id]["soft_context_available"] = False
+        states[worker_id]["pending_soft_context_note_seq"] = None
+        states[worker_id]["soft_context_notice_after_step"] = None
         emit_optional(
             event_logger,
             "worker_stop",
@@ -1052,6 +1305,229 @@ def handle_action(
         message="; ".join(action.errors),
     )
     return {"action": action_name, "errors": action.errors}
+
+
+def admit_failure_note(
+    *,
+    db_path: Path,
+    problem_id: str,
+    failed_worker_id: str,
+    step_index: int,
+    proof_patch: str,
+    submit_result: object,
+    event_logger: EventLogger | None,
+) -> SharedNote:
+    error_messages = getattr(submit_result, "error_messages", []) or []
+    content = "\n".join(
+        [
+            f"failed_worker_id: {failed_worker_id}",
+            f"step_index: {step_index}",
+            f"check_status: {getattr(submit_result, 'check_status', None)}",
+            f"returncode: {getattr(submit_result, 'returncode', None)}",
+            f"tactic_keywords: {', '.join(extract_tactic_keywords(proof_patch)) or '(none detected)'}",
+            "",
+            "error_messages:",
+            truncate_text("\n".join(str(message) for message in error_messages), 1500)
+            or "(none)",
+            "",
+            "failed_proof_patch_preview:",
+            "```lean",
+            truncate_text(proof_patch, 1800),
+            "```",
+            "",
+            "guidance:",
+            "- Avoid repeating the same proof patch.",
+            "- Inspect the Lean errors before trying a similar tactic or rewrite pattern.",
+            "- Prefer a shorter, more robust patch if this attempt timed out.",
+        ]
+    )
+    saved = append_note(
+        db_path,
+        SharedNote(
+            seq=None,
+            problem_id=problem_id,
+            worker_id="interactive_controller",
+            type="FAIL",
+            content=truncate_text(content, 3800),
+            target_seq=getattr(submit_result, "proof_patch_seq", None),
+            attempt_path=getattr(submit_result, "attempt_path", None),
+            status="failed",
+            metadata={
+                "source": "event_pull",
+                "failed_worker_id": failed_worker_id,
+                "step_index": step_index,
+                "check_status": getattr(submit_result, "check_status", None),
+            },
+        ),
+        writer_role="system",
+    )
+    emit_optional(
+        event_logger,
+        "failure_note_admitted",
+        step=step_index,
+        worker_id=failed_worker_id,
+        note_seq=saved.seq,
+        check_status=getattr(submit_result, "check_status", None),
+        content_chars=len(saved.content),
+    )
+    return saved
+
+
+def mark_event_context_pull_required(
+    *,
+    states: dict[str, dict[str, Any]],
+    failed_worker_id: str,
+    step_index: int,
+    note_seq: int | None,
+    max_context_requests_per_worker: int,
+    budget: "TimeBudget",
+    min_remaining_sec_to_start_call: float,
+    event_logger: EventLogger | None,
+) -> None:
+    for worker_id, worker_state in states.items():
+        if worker_id == failed_worker_id or not worker_state.get("active"):
+            continue
+        if remaining_context_request_budget(
+            int(worker_state.get("context_request_count", 0)),
+            max_context_requests_per_worker,
+        ) == 0:
+            emit_optional(
+                event_logger,
+                "event_context_pull_skipped_due_to_limit",
+                step=step_index,
+                worker_id=worker_id,
+                failed_worker_id=failed_worker_id,
+                pending_context_note_seq=note_seq,
+            )
+            continue
+        if not has_enough_time_to_start_call(budget, min_remaining_sec_to_start_call):
+            emit_optional(
+                event_logger,
+                "event_context_pull_skipped_due_to_budget",
+                step=step_index,
+                worker_id=worker_id,
+                failed_worker_id=failed_worker_id,
+                pending_context_note_seq=note_seq,
+                remaining_sec=budget.remaining(),
+                min_remaining_sec_to_start_call=min_remaining_sec_to_start_call,
+            )
+            continue
+        if worker_state.get("last_seen_context_seq") == note_seq:
+            continue
+        worker_state["force_context_request"] = True
+        worker_state["force_context_request_after_step"] = step_index + 1
+        worker_state["pending_context_note_seq"] = note_seq
+        emit_optional(
+            event_logger,
+            "event_context_pull_required",
+            step=step_index,
+            worker_id=worker_id,
+            failed_worker_id=failed_worker_id,
+            pending_context_note_seq=note_seq,
+        )
+
+
+def mark_soft_context_pull_available(
+    *,
+    states: dict[str, dict[str, Any]],
+    failed_worker_id: str,
+    step_index: int,
+    note_seq: int | None,
+    max_context_requests_per_worker: int,
+    budget: "TimeBudget",
+    min_remaining_sec_to_start_call: float,
+    event_logger: EventLogger | None,
+) -> None:
+    for worker_id, worker_state in states.items():
+        if worker_id == failed_worker_id or not worker_state.get("active"):
+            continue
+        if remaining_context_request_budget(
+            int(worker_state.get("context_request_count", 0)),
+            max_context_requests_per_worker,
+        ) == 0:
+            emit_optional(
+                event_logger,
+                "soft_context_pull_skipped_due_to_limit",
+                step=step_index,
+                worker_id=worker_id,
+                failed_worker_id=failed_worker_id,
+                pending_soft_context_note_seq=note_seq,
+            )
+            continue
+        if not has_enough_time_to_start_call(budget, min_remaining_sec_to_start_call):
+            emit_optional(
+                event_logger,
+                "soft_context_pull_skipped_due_to_budget",
+                step=step_index,
+                worker_id=worker_id,
+                failed_worker_id=failed_worker_id,
+                pending_soft_context_note_seq=note_seq,
+                remaining_sec=budget.remaining(),
+                min_remaining_sec_to_start_call=min_remaining_sec_to_start_call,
+            )
+            continue
+        if worker_state.get("last_seen_context_seq") == note_seq:
+            continue
+        pending_seq = worker_state.get("pending_soft_context_note_seq")
+        notice_after_step = worker_state.get("soft_context_notice_after_step")
+        if (
+            worker_state.get("soft_context_available")
+            and pending_seq is not None
+            and (note_seq is None or int(pending_seq) >= int(note_seq))
+        ):
+            continue
+        if (
+            worker_state.get("soft_context_available")
+            and notice_after_step is not None
+            and step_index < int(notice_after_step)
+        ):
+            continue
+        worker_state["soft_context_available"] = True
+        worker_state["pending_soft_context_note_seq"] = note_seq
+        worker_state["soft_context_notice_after_step"] = step_index + 1
+        worker_state["soft_context_notice_count"] = int(
+            worker_state.get("soft_context_notice_count", 0)
+        ) + 1
+        emit_optional(
+            event_logger,
+            "soft_context_pull_available",
+            step=step_index,
+            worker_id=worker_id,
+            failed_worker_id=failed_worker_id,
+            pending_soft_context_note_seq=note_seq,
+            soft_context_notice_count=worker_state["soft_context_notice_count"],
+        )
+
+
+def extract_tactic_keywords(proof_patch: str) -> list[str]:
+    keywords = [
+        "simp",
+        "rw",
+        "rewrite",
+        "omega",
+        "ring_nf",
+        "norm_num",
+        "aesop",
+        "linarith",
+        "nlinarith",
+        "field_simp",
+        "positivity",
+        "exact",
+        "apply",
+        "calc",
+    ]
+    found = []
+    for keyword in keywords:
+        if keyword in proof_patch:
+            found.append(keyword)
+    return found
+
+
+def truncate_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    omitted = len(text) - max_chars
+    return f"{text[:max_chars]}\n... [truncated {omitted} chars]"
 
 
 def record_malformed_action(
@@ -1118,7 +1594,20 @@ def build_step_prompt(
         last_check_status=worker_state.get("last_check_status"),
         last_error=worker_state.get("last_error"),
         shared_context_policy=shared_context_policy,
+        force_context_request=bool(worker_state.get("force_context_request", False)),
+        pending_context_note_seq=worker_state.get("pending_context_note_seq"),
+        soft_context_available=bool(worker_state.get("soft_context_available", False)),
+        pending_soft_context_note_seq=worker_state.get("pending_soft_context_note_seq"),
     )
+
+
+def prompt_context_for_policy(context_text: str, shared_context_policy: str) -> str:
+    if shared_context_policy in {"event_pull", "event_pull_soft"}:
+        return (
+            "(Shared Context is not automatically shown in event_pull modes. "
+            "Use REQUEST_CONTEXT if you need the latest failure details.)"
+        )
+    return context_text
 
 
 def append_history(
@@ -1200,7 +1689,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-remaining-sec-to-start-call", type=float, default=30)
     parser.add_argument(
         "--shared-context-policy",
-        choices=("legacy", "balanced", "aggressive"),
+        choices=("legacy", "balanced", "aggressive", "event_pull", "event_pull_soft"),
         default="legacy",
     )
     parser.add_argument("--fresh", action="store_true")

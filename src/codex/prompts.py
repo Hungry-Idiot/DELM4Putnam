@@ -75,8 +75,8 @@ def build_main_agent_planning_prompt(
     return f"""You are the centralized Main Agent theorem-proving coordinator for a PutnamBench Lean4 problem.
 
 Read the theorem and create a short task plan for {num_workers} independent Workers.
-Workers cannot run commands, cannot modify files, cannot read Shared Context, and cannot communicate with each other.
-Each Worker should receive one concrete, small, executable task. Workers return analysis, candidate lemmas, proof ideas, or local Lean snippets only.
+Workers cannot run commands, cannot modify files, cannot read Shared Context, cannot communicate with each other, and cannot submit patches to Lean.
+Each Worker should receive one concrete, small, executable task. Workers return analysis, candidate lemmas, proof ideas, local Lean snippets, or a complete candidate proof patch for the Main Agent to consider.
 You will later synthesize all Worker reports into one final proof patch.
 If previous round information is provided, use it to avoid repeated failed strategies.
 
@@ -136,8 +136,11 @@ You are not the Main Agent. Complete only the local task assigned to you.
 Do not try to solve the whole problem unless the task explicitly asks for that.
 Do not read or use Shared Context. Do not communicate with other Workers.
 Do not run commands. Do not modify files.
-You may provide analysis, a candidate lemma, a local proof idea, failure risks, suggestions, or a small Lean snippet.
-If you output Lean code, do not use `sorry`, `admit`, or `axiom`.
+You cannot submit a patch or run Lean. The Main Agent will choose, modify, integrate, and submit the final proof patch.
+You may provide analysis, candidate lemmas, a local proof idea, failure risks, useful tactics, or a complete candidate proof patch.
+If you have a plausible complete proof body, include it as CANDIDATE_PROOF_PATCH. It should be Lean code that can replace the theorem body's `sorry`, and it should usually start with `by`.
+If you do not have a complete patch, leave CANDIDATE_PROOF_PATCH empty and provide the most useful partial proof idea instead.
+Do not use `sorry`, `admit`, or `axiom` in any Lean code.
 
 Problem:
 problem_id: {problem_id}
@@ -158,17 +161,18 @@ Output exactly:
 
 WORKER_REPORT
 worker_id: {worker_id}
-status: useful | uncertain | failed
+status: solved | partial | failed
 summary: <short summary>
 
 DETAILS
-<worker details>
+<analysis, proof idea, risks, useful lemmas, or partial tactics>
 
-OPTIONAL_LEAN_SNIPPET
+CANDIDATE_PROOF_PATCH
 ```lean
-...
+by
+  ...
 ```
-END_OPTIONAL_LEAN_SNIPPET
+END_CANDIDATE_PROOF_PATCH
 END_WORKER_REPORT
 """
 
@@ -191,6 +195,34 @@ The proof patch must be Lean code that can replace the theorem body's `sorry`.
 Do not use `sorry`, `admit`, or `axiom`.
 If you cannot complete the proof, output a concrete attempt without placeholders.
 Do not run commands. Do not modify files.
+Workers may provide complete CANDIDATE_PROOF_PATCH blocks, partial Lean snippets, lemmas, or risk notes.
+The final submission is your responsibility as Main Agent: output exactly one final proof patch.
+
+Conservative synthesis policy:
+- Read all Worker reports before writing the final patch.
+- If any Worker provides a complete CANDIDATE_PROOF_PATCH, first check whether it can be used directly.
+- Prefer the shortest, most direct, most Lean-plausible complete candidate patch.
+- If a Worker patch looks complete, make only the minimum necessary edits.
+- Do not mechanically concatenate multiple Worker patches.
+- Do not make a simple proof more complex merely to "synthesize" multiple reports.
+- Only generate a new proof from multiple partial ideas when no complete candidate patch looks usable.
+- You may combine local lemmas or insights, but the final output must be one coherent proof body.
+
+Previous-round failure policy:
+- If previous_round_text contains a failed proof patch or Lean errors, do not repeat that failed proof body.
+- Avoid the tactic sequence, rewrite path, or automation pattern that caused the previous errors.
+- If the previous error was rewrite failed, do not blindly continue the same rewrite route.
+- If the previous error was simp made no progress, do not repeat unsupported `simp`.
+- If omega, linarith, norm_num, or similar automation failed to close the goal, do not just restyle the same automation attempt.
+- If the previous check timed out, produce a shorter, more direct proof with less search, normalization, and broad simplification.
+- Do not stack heavy tactics just to gamble on success.
+
+Lean proof style preferences:
+- Prefer short proofs with explicit intermediate `have` statements.
+- Use readable local facts instead of large tactic searches.
+- Use targeted `simp`, `norm_num`, `omega`, or arithmetic tactics only when the goal structure supports them.
+- Avoid unsupported `rw` / `rewrite` steps.
+- Prefer robust transformations that are visibly justified by the theorem context.
 
 Problem:
 problem_id: {problem_id}
@@ -246,7 +278,21 @@ def build_interactive_worker_step_prompt(
     last_check_status: str | None = None,
     last_error: str | None = None,
     shared_context_policy: str = "legacy",
+    force_context_request: bool = False,
+    pending_context_note_seq: int | None = None,
+    soft_context_available: bool = False,
+    pending_soft_context_note_seq: int | None = None,
 ) -> str:
+    forced_context_section = _event_pull_forced_context_section(
+        shared_context_policy=shared_context_policy,
+        force_context_request=force_context_request,
+        pending_context_note_seq=pending_context_note_seq,
+    )
+    soft_context_section = _event_pull_soft_context_section(
+        shared_context_policy=shared_context_policy,
+        soft_context_available=soft_context_available,
+        pending_soft_context_note_seq=pending_soft_context_note_seq,
+    )
     context_policy = _interactive_context_policy(
         max_context_requests_per_worker=max_context_requests_per_worker,
         context_request_count=context_request_count,
@@ -255,12 +301,21 @@ def build_interactive_worker_step_prompt(
         last_check_status=last_check_status,
         last_error=last_error,
         shared_context_policy=shared_context_policy,
+        force_context_request=force_context_request,
     )
     context_policy_section = ""
     if context_policy:
         context_policy_section = f"\nShared-context policy:\n{context_policy}\n"
     request_context_format = ""
-    if shared_context_policy != "legacy" and max_context_requests_per_worker != 0:
+    context_requests_available = (
+        max_context_requests_per_worker < 0
+        or context_request_count < max_context_requests_per_worker
+    )
+    if (
+        shared_context_policy != "legacy"
+        and max_context_requests_per_worker != 0
+        and context_requests_available
+    ):
         request_context_format = """WORKER_ACTION
 action: REQUEST_CONTEXT
 summary: <why you need latest context>
@@ -269,11 +324,28 @@ END_WORKER_ACTION
 or
 
 """
+    if shared_context_policy in {"event_pull", "event_pull_soft"}:
+        context_source_text = (
+            "You learn about other Agents only when you explicitly request Shared Context "
+            "and the controller writes the returned context into your local history."
+        )
+        context_intro = (
+            "Shared Context is not automatically shown in event_pull modes. "
+            "When useful, use REQUEST_CONTEXT; "
+            "the returned context will appear in your local history on a later step."
+        )
+    else:
+        context_source_text = (
+            "You only learn about other Agents indirectly through compact Shared Context shown in this prompt."
+        )
+        context_intro = (
+            "The context below is the controller's most recent context snapshot for you."
+        )
     return f"""You are decentralized peer worker {worker_id} in a pull-based Shared Context multi-agent experiment.
 
 You are not a Main Agent. There is no Main Agent in this experiment.
-You only learn about other Agents indirectly through compact Shared Context shown in this prompt.
-The context below is the controller's most recent context snapshot for you.
+{context_source_text}
+{context_intro}
 If you want to submit a candidate proof patch, output SUBMIT_PATCH.
 If you want to record a short useful note, output SUBMIT_NOTE.
 If you do not need to continue, output STOP.
@@ -288,6 +360,8 @@ Rules:
 - Do not communicate directly with other Workers.
 - Do not use full audit log content.
 - Proof patches must not contain `sorry`, `admit`, or `axiom`.
+{forced_context_section}
+{soft_context_section}
 {context_policy_section}
 
 Problem:
@@ -353,9 +427,34 @@ def _interactive_context_policy(
     last_check_status: str | None,
     last_error: str | None,
     shared_context_policy: str = "legacy",
+    force_context_request: bool = False,
 ) -> str:
     if shared_context_policy == "legacy":
         return ""
+    if shared_context_policy == "event_pull":
+        if force_context_request:
+            return "\n".join(
+                [
+                    "- Event-triggered Shared Context pull is required in this step.",
+                    "- Output REQUEST_CONTEXT exactly as instructed above.",
+                    "- Do not submit a proof patch in this step.",
+                ]
+            )
+        return "\n".join(
+            [
+                "- Event-pull policy: Shared Context is requested only when a new failure event requires it.",
+                "- Do not request context just because it is available.",
+                "- If no event-triggered pull is required, choose SUBMIT_PATCH when you have a concrete proof idea, otherwise SUBMIT_NOTE or STOP.",
+            ]
+        )
+    if shared_context_policy == "event_pull_soft":
+        return "\n".join(
+            [
+                "- Soft event-pull policy: Shared Context is not automatically shown.",
+                "- If no soft notice is shown, do not request context just because it is available.",
+                "- If a soft notice is shown, REQUEST_CONTEXT is optional; SUBMIT_PATCH is still allowed when you have a high-confidence proof.",
+            ]
+        )
 
     previous_actions_text = ", ".join(previous_actions[-8:]) or "(none)"
     last_check_text = last_check_status or "(none)"
@@ -420,3 +519,59 @@ def _interactive_context_policy(
             "- Context should improve proof search, not replace proof search.",
         ]
     )
+
+
+def _event_pull_forced_context_section(
+    *,
+    shared_context_policy: str,
+    force_context_request: bool,
+    pending_context_note_seq: int | None,
+) -> str:
+    if shared_context_policy != "event_pull" or not force_context_request:
+        return ""
+    note_text = (
+        f" Pending failure note seq: {pending_context_note_seq}."
+        if pending_context_note_seq is not None
+        else ""
+    )
+    return f"""
+Event-triggered Shared Context pull is required.
+
+Another worker submitted a proof patch that failed Lean verification.
+A compact failure note has been written to Shared Context.{note_text}
+Before attempting another patch, you must request the latest Shared Context.
+
+Output exactly:
+
+WORKER_ACTION
+action: REQUEST_CONTEXT
+summary: Need latest failure note before trying another proof.
+END_WORKER_ACTION
+
+Do not submit a proof patch in this step.
+"""
+
+
+def _event_pull_soft_context_section(
+    *,
+    shared_context_policy: str,
+    soft_context_available: bool,
+    pending_soft_context_note_seq: int | None,
+) -> str:
+    if shared_context_policy != "event_pull_soft" or not soft_context_available:
+        return ""
+    note_text = (
+        f" Pending failure note seq: {pending_soft_context_note_seq}."
+        if pending_soft_context_note_seq is not None
+        else ""
+    )
+    return f"""
+New Shared Context failure information is available from another worker.{note_text}
+
+You have two options:
+- Option A: If you are uncertain, or your next proof may repeat the same failure, output REQUEST_CONTEXT to inspect the latest failure note.
+- Option B: If you already have a high-confidence proof patch, you may directly SUBMIT_PATCH.
+
+Do not request context just because it is available.
+Request context only if it is likely to change your next proof attempt.
+"""

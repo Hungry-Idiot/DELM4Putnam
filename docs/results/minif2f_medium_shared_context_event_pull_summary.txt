@@ -1,0 +1,46 @@
+========== shared-context event_pull batch summary ==========
+run root: runs/minif2f_medium_batch_2w_shared_context_event_pull
+total problems: 6
+success: 6
+success rate: 100.00%
+
+---------- time / cost ----------
+total wall time, summed over problems: 417.81s
+avg wall_elapsed per problem: 69.63s
+avg time_to_success among solved: 69.63s
+total codex calls: 20
+avg codex calls per problem: 3.33
+
+---------- context behavior ----------
+total context requests: 4
+total event context requests: 4
+failure notes admitted: 5
+event_context_pull_required: 5
+event_context_pull_handled: 4
+forced_context_request_missed: 0
+
+---------- stopped_reason by problem ----------
+success: 6
+
+---------- key event counts ----------
+worker_return: 15
+patch_submit_start: 11
+patch_submit_end: 11
+run_end: 6
+failure_note_admitted: 5
+event_context_pull_required: 5
+event_context_pull_handled: 4
+request_context_handled: 4
+
+---------- per-problem result ----------
+minif2f_medium_amc12a_2003_p1, success=True, steps=5, time=251.40196601500065, wall=251.4019656190012, codex_calls=10, context_requests=4, event_context_requests=4, failure_notes=4, stopped=success
+minif2f_medium_amc12b_2003_p9, success=True, steps=1, time=31.689127061999898, wall=31.6891267459996, codex_calls=2, context_requests=0, event_context_requests=0, failure_notes=0, stopped=success
+minif2f_medium_mathd_algebra_116, success=True, steps=1, time=32.32196281200049, wall=32.32196244000079, codex_calls=2, context_requests=0, event_context_requests=0, failure_notes=0, stopped=success
+minif2f_medium_mathd_numbertheory_109, success=True, steps=1, time=53.367572515000575, wall=53.36757219299943, codex_calls=2, context_requests=0, event_context_requests=0, failure_notes=1, stopped=success
+minif2f_medium_mathd_numbertheory_149, success=True, steps=1, time=20.439290648999304, wall=20.439290328000425, codex_calls=2, context_requests=0, event_context_requests=0, failure_notes=0, stopped=success
+minif2f_medium_mathd_numbertheory_211, success=True, steps=1, time=28.589093067999784, wall=28.589092794998578, codex_calls=2, context_requests=0, event_context_requests=0, failure_notes=0, stopped=success
+
+saved files:
+- runs/minif2f_medium_batch_2w_shared_context_event_pull/stats/summary.txt
+- runs/minif2f_medium_batch_2w_shared_context_event_pull/stats/summary.csv
+- runs/minif2f_medium_batch_2w_shared_context_event_pull/stats/summary.json

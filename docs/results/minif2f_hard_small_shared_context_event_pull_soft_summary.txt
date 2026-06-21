@@ -1,0 +1,41 @@
+========== hard-small shared-context event_pull_soft batch summary ==========
+run root: runs/minif2f_hard_small_batch_2w_shared_context_event_pull_soft
+total problems: 8
+success: 6
+success rate: 75.00%
+
+---------- time / cost ----------
+total wall time, summed over problems: 4351.48s
+avg wall_elapsed per problem: 543.93s
+avg time_to_success among solved: 147.28s
+total codex calls: 40
+avg codex calls per problem: 5.00
+
+---------- context behavior ----------
+total context requests: 6
+total event context requests: 2
+failure notes admitted: 15
+soft_context_pull_available: 10
+soft_context_pull_handled: 2
+soft_context_pull_declined_or_bypassed: 6
+request_context_ignored: 0
+codex_timeout: 7
+
+---------- stopped_reason by problem ----------
+success: 6
+time_budget_exceeded: 2
+
+---------- per-problem result ----------
+minif2f_hard_small_amc12_2001_p9, success=True, steps=1, time=25.75120198699915, wall=25.751201745999424, codex_calls=2, patch_attempts=1, context_requests=0, failure_notes=0, codex_timeout=0, stopped=success
+minif2f_hard_small_amc12a_2009_p9, success=True, steps=1, time=26.08821951199934, wall=26.088218942999447, codex_calls=2, patch_attempts=1, context_requests=0, failure_notes=0, codex_timeout=0, stopped=success
+minif2f_hard_small_amc12a_2015_p10, success=True, steps=1, time=275.5737152059992, wall=275.573714922999, codex_calls=2, patch_attempts=1, context_requests=0, failure_notes=0, codex_timeout=0, stopped=success
+minif2f_hard_small_amc12a_2019_p9, success=False, steps=7, time=None, wall=1667.9591277209984, codex_calls=14, patch_attempts=10, context_requests=2, failure_notes=10, codex_timeout=0, stopped=time_budget_exceeded
+minif2f_hard_small_mathd_algebra_140, success=True, steps=2, time=209.2204086870006, wall=209.22040838100293, codex_calls=4, patch_attempts=1, context_requests=0, failure_notes=0, codex_timeout=0, stopped=success
+minif2f_hard_small_mathd_algebra_73, success=True, steps=1, time=63.0034577410006, wall=63.00345734599978, codex_calls=2, patch_attempts=1, context_requests=0, failure_notes=0, codex_timeout=0, stopped=success
+minif2f_hard_small_mathd_numbertheory_13, success=True, steps=1, time=284.03427312799977, wall=284.03427269700114, codex_calls=2, patch_attempts=1, context_requests=0, failure_notes=0, codex_timeout=0, stopped=success
+minif2f_hard_small_mathd_numbertheory_780, success=False, steps=6, time=None, wall=1799.8485030030024, codex_calls=12, patch_attempts=5, context_requests=4, failure_notes=5, codex_timeout=7, stopped=time_budget_exceeded
+
+saved files:
+- runs/minif2f_hard_small_batch_2w_shared_context_event_pull_soft/stats/summary.txt
+- runs/minif2f_hard_small_batch_2w_shared_context_event_pull_soft/stats/summary.csv
+- runs/minif2f_hard_small_batch_2w_shared_context_event_pull_soft/stats/summary.json
