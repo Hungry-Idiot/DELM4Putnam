@@ -646,7 +646,7 @@ def worker_report_text(worker_id: str, worker_run: object) -> str:
 
 def effective_max_concurrency(args: argparse.Namespace) -> int:
     num_workers = max(1, int(args.num_workers))
-    requested = args.max_concurrency
+    requested = getattr(args, "max_concurrency", None)
     if requested is None:
         requested = num_workers
     return max(1, min(int(requested), num_workers))

@@ -207,6 +207,10 @@ def main() -> int:
     first_context = pull_worker_context(db_path, problem_id)
 
     if args.dry_run:
+        shared_context_policy = getattr(args, "shared_context_policy", "legacy")
+        max_context_requests_per_worker = getattr(
+            args, "max_context_requests_per_worker", 1
+        )
         print("Interactive Shared Context agents dry-run")
         print(f"problem_id: {problem_id}")
         print(f"num_workers: {args.num_workers}")
@@ -217,17 +221,17 @@ def main() -> int:
         print(f"model: {args.model or '(not set)'}")
         print(f"API key will be read from env var: {args.api_key_env}")
         print(f"time_budget_sec: {args.time_budget_sec:g}")
-        print(f"shared_context_policy: {args.shared_context_policy}")
+        print(f"shared_context_policy: {shared_context_policy}")
         print(
             f"max_context_requests_per_worker: "
-            f"{args.max_context_requests_per_worker}"
+            f"{max_context_requests_per_worker}"
         )
         print(f"wall-clock budget mode: {budget_mode(args.time_budget_sec)}")
         if args.time_budget_sec > 0:
             print(f"This run will stop after {args.time_budget_sec:g} seconds unless solved earlier.")
         print("For parallel architecture comparison, use different --run-dir and --db for each architecture to avoid conflicts.")
         print("Shared Context mode: worker")
-        if args.shared_context_policy in {"event_pull", "event_pull_soft"}:
+        if shared_context_policy in {"event_pull", "event_pull_soft"}:
             print(
                 "Interactive semantics: event_pull policies do not automatically "
                 "inject full Shared Context into each prompt. Workers must use "
@@ -247,7 +251,7 @@ def main() -> int:
                 worker_id="A1",
                 step_index=1,
                 current_context_text=prompt_context_for_policy(
-                    first_context, getattr(args, "shared_context_policy", "legacy")
+                    first_context, shared_context_policy
                 ),
                 worker_history_text="",
                 worker_state={
@@ -266,10 +270,8 @@ def main() -> int:
                     "soft_context_notice_after_step": None,
                     "soft_context_notice_count": 0,
                 },
-                max_context_requests_per_worker=getattr(
-                    args, "max_context_requests_per_worker", 1
-                ),
-                shared_context_policy=getattr(args, "shared_context_policy", "legacy"),
+                max_context_requests_per_worker=max_context_requests_per_worker,
+                shared_context_policy=shared_context_policy,
             )
         )
         return 0
