@@ -124,6 +124,30 @@ temp/
 
 # =========================
 
+# Local mini paper / LaTeX artifacts
+
+# =========================
+
+paper_cn.tex
+shared_state_parallel_proving_mini_paper*
+mini_paper*
+paper.pdf
+*.aux
+*.out
+*.toc
+*.synctex.gz
+*.fls
+*.fdb_latexmk
+课程大作业latex模板.zip
+paper/
+papers/
+mini_paper/
+latex/
+outputs/paper/
+docs/paper/
+
+# =========================
+
 # Notebook / analysis cache
 
 # =========================
