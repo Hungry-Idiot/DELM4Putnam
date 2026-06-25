@@ -230,6 +230,16 @@ Shared Context 并没有解决所有问题：
 
 以下命令是单题运行模板。批量运行时可遍历对应 `problems.txt`。不要把 `.env`、API key、SQLite 数据库、run log 或 attempts 文件提交到仓库。
 
+建议运行实验时显式传入 `--problem-id`，并从对应 `runs/minif2f_*/problems.txt` 中读取题目 id。
+
+Python 侧轻量开发依赖可以通过以下命令安装：
+
+```bash
+pip install -r requirements-dev.txt
+```
+
+其中 `pytest` 用于运行测试，`python-dotenv` 用于从 `.env` 加载 relay / model / API 配置。`.env` 不应提交到仓库，用户可以参考 `.env.example` 准备本地配置。Lean4 / Lake / Mathlib 和 `data/PutnamBench/` 仍然需要用户本地准备。
+
 ### 7.1 Shared Context easy 示例
 
 ```bash
@@ -325,6 +335,11 @@ DELM4Putnam/
 │   ├── experiments/
 │   │   ├── run_interactive_shared_context_agents.py
 │   │   └── build_minif2f_hard_small.py
+│   ├── data/
+│   │   ├── inspect_putnam_lean.py
+│   │   ├── make_putnam_subset.py
+│   │   ├── select_putnam_candidates.py
+│   │   └── smoke_check_lean_patch.py
 │   └── baselines/
 │       └── run_single_main_agent.py
 ├── src/
@@ -355,7 +370,12 @@ DELM4Putnam/
 - `src/data/`：Lean problem loader；
 - `scripts/experiments/`：Shared Context runner；
 - `scripts/baselines/`：Single-main baseline runner；
-- `docs/results/`：轻量实验结果摘要。
+- `scripts/data/`：PutnamBench 数据检查、候选题筛选和 smoke check 工具；
+- `scripts/data/inspect_putnam_lean.py`：统计 / 检查 PutnamBench Lean 文件；
+- `scripts/data/make_putnam_subset.py`：生成小型 Putnam problem id 列表；
+- `scripts/data/select_putnam_candidates.py`：静态筛选候选题目；
+- `scripts/data/smoke_check_lean_patch.py`：单题 Lean patch smoke check；
+- `docs/results/`：轻量实验结果摘要，目录内 README 汇总当前结果表。
 
 注意：`data/PutnamBench/` 是本地外部 Lean4 数据目录。为避免误提交完整外部仓库，本项目父仓库只跟踪 `runs/minif2f_easy/problems.txt`、`runs/minif2f_medium/problems.txt` 和 `runs/minif2f_hard_small/problems.txt` 等轻量 problem list，不跟踪 `data/PutnamBench/` 内部文件。
 
