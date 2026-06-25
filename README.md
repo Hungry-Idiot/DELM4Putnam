@@ -108,9 +108,11 @@ Main Agent planning
 
 ## 4. Benchmarks
 
-本项目使用 PutnamBench Lean4 数据目录中的 miniF2F / math competition 风格题目构造课程实验 benchmark。
+本项目使用 PutnamBench Lean4 数据目录中的 miniF2F / math competition 风格题目构造课程实验 benchmark。`data/PutnamBench/` 被视为外部数据目录，需要用户在本地准备；本仓库不提交完整 PutnamBench 外部仓库，也不把它作为 submodule 跟踪。
 
-| Benchmark | 文件 | problem list | 题目数 | 说明 |
+下表中的 `.lean` 文件路径是本地运行时路径，位于用户准备好的 `data/PutnamBench/lean4/` 目录中。本仓库跟踪的是轻量 problem list 和项目代码。
+
+| Benchmark | 本地 Lean batch 文件 | 仓库跟踪的 problem list | 题目数 | 说明 |
 |---|---|---|---:|---|
 | miniF2F-easy | `data/PutnamBench/lean4/src/minif2f_easy_batch.lean` | `runs/minif2f_easy/problems.txt` | 12 | 较简单的 Lean 证明任务 |
 | miniF2F-medium | `data/PutnamBench/lean4/src/minif2f_medium_batch.lean` | `runs/minif2f_medium/problems.txt` | 6 | 中等难度任务 |
@@ -121,6 +123,8 @@ Main Agent planning
 ```text
 scripts/experiments/build_minif2f_hard_small.py
 ```
+
+该脚本会在本地 PutnamBench 目录下生成 `data/PutnamBench/lean4/src/minif2f_hard_small_batch.lean`。生成文件属于外部数据目录内容，默认不由本项目父仓库跟踪。
 
 hard-small 题目包括：
 
@@ -353,6 +357,8 @@ DELM4Putnam/
 - `scripts/baselines/`：Single-main baseline runner；
 - `docs/results/`：轻量实验结果摘要。
 
+注意：`data/PutnamBench/` 是本地外部 Lean4 数据目录。为避免误提交完整外部仓库，本项目父仓库只跟踪 `runs/minif2f_easy/problems.txt`、`runs/minif2f_medium/problems.txt` 和 `runs/minif2f_hard_small/problems.txt` 等轻量 problem list，不跟踪 `data/PutnamBench/` 内部文件。
+
 ## 9. Reproducibility Notes
 
 复现实验需要：
@@ -360,8 +366,10 @@ DELM4Putnam/
 - Python / conda 环境，例如 `putnamdelm`；
 - Lean4 / Lake / Mathlib 环境；
 - Codex 或 OpenAI API key；
-- PutnamBench Lean4 数据；
+- 本地 PutnamBench Lean4 数据目录；
 - 合理的 timeout 和 run directory 设置。
+
+clone 本仓库后，如果要复现实验，需要先在 `data/PutnamBench/lean4/` 准备 Lean4 / Mathlib 环境和对应 batch 文件。`miniF2F-hard-small` 可通过 `scripts/experiments/build_minif2f_hard_small.py` 在本地 PutnamBench 目录中生成；easy / medium batch 文件也需要在本地 PutnamBench 目录中存在。
 
 实验结果可能因以下因素变化：
 

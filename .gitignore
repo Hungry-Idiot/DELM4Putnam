@@ -54,18 +54,12 @@ ENV/
 
 # =========================
 
-# PutnamBench is external and should not be committed, except for small
-# project-owned benchmark definitions.
-
 data/*
 !data/.gitkeep
-!data/PutnamBench/
-data/PutnamBench/*
-!data/PutnamBench/lean4/
-data/PutnamBench/lean4/*
-!data/PutnamBench/lean4/src/
-data/PutnamBench/lean4/src/*
-!data/PutnamBench/lean4/src/minif2f_hard_small_batch.lean
+
+# External repositories / external benchmark data
+data/PutnamBench/
+external/DeepSeek-Prover-V1.5/
 
 # =========================
 
@@ -78,6 +72,12 @@ outputs/
 
 runs/*
 !runs/.gitkeep
+!runs/minif2f_easy/
+runs/minif2f_easy/*
+!runs/minif2f_easy/problems.txt
+!runs/minif2f_medium/
+runs/minif2f_medium/*
+!runs/minif2f_medium/problems.txt
 !runs/minif2f_hard_small/
 runs/minif2f_hard_small/*
 !runs/minif2f_hard_small/problems.txt

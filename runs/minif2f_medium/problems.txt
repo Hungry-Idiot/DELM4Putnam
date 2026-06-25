@@ -1,0 +1,6 @@
+minif2f_medium_amc12a_2003_p1
+minif2f_medium_amc12b_2003_p9
+minif2f_medium_mathd_algebra_116
+minif2f_medium_mathd_numbertheory_109
+minif2f_medium_mathd_numbertheory_149
+minif2f_medium_mathd_numbertheory_211
